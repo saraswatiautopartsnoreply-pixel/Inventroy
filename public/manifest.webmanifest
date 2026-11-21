@@ -1,0 +1,11 @@
+{
+  "name": "Saraswati Inventory System",
+  "short_name": "Saraswati Stock",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f2f4f7",
+  "theme_color": "#13253a",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
