@@ -102,15 +102,23 @@ function ProductForm({ product, racks, onClose, onSave }) {
   </Modal>;
 }
 
-function AlternativesModal({ product, products, onClose }) {
+function AlternativesModal({ product, products, onClose, onSell, canSell }) {
   const alternatives = products.filter((item) => item.id !== product.id && item.oe.some((number) => product.oe.includes(number)));
   return <Modal title="OE number alternatives" onClose={onClose} wide>
     <div className="oe-modal-intro"><div className="oe-symbol"><Link2 size={19} /></div><div><strong>{product.name}</strong><p>Matching OE number{product.oe.length === 1 ? '' : 's'}: {product.oe.join(' · ') || 'None added'}</p></div></div>
-    <div className="alternatives-list">{alternatives.length ? alternatives.map((alt) => <div className="alternative-row" key={alt.id}><div className="alternative-main"><strong>{alt.name}</strong><span>{alt.brand} <i>·</i> {alt.sku}</span></div><div className="alternative-stock"><strong className={availableFor(alt) ? 'stock-good' : 'stock-zero'}>{availableFor(alt)} units</strong><span>{alt.locations.map((loc) => `${loc.warehouse} · ${loc.rack}`).join(', ')}</span></div><div className="alternative-price">{fmt(alt.price)}<small>{alt.priceIncludesGst ? 'GST included' : 'plus 18% GST'}</small></div></div>) : <div className="empty-state"><Link2 size={22} /><strong>No alternatives yet</strong><span>Add the same OE number to another product to link them.</span></div>}</div>
+    <div className="alternatives-list">{alternatives.length ? alternatives.map((alt) => {
+      const stock = availableFor(alt);
+      const stockLocations = alt.locations.filter((location) => Number(location.qty || 0) - Number(location.reserved || 0) > 0);
+      return <div className="alternative-row" key={alt.id}>
+        <div className="alternative-main"><strong>{alt.name}</strong><span>{alt.brand} <i>·</i> {alt.sku}</span></div>
+        <div className="alternative-stock"><strong className={stock ? 'stock-good' : 'stock-zero'}>{stock} {alt.unit || 'PCS'}</strong><span>{stockLocations.map((location) => `${location.warehouse || 'Unassigned'}${location.rack ? ` · ${location.rack}` : ''}`).join(', ') || 'No available stock'}</span></div>
+        <div className="alternative-price">{fmt(alt.price)}<small>{alt.priceIncludesGst ? 'GST included' : 'plus 18% GST'}</small></div>
+        {canSell && <div className="alternative-actions"><button className={`button ${stock ? 'button-primary' : 'button-quiet'}`} disabled={!stock} onClick={() => { onSell(alt); onClose(); }} title={stock ? `Sell ${alt.name}` : 'No available stock'}><ShoppingCart size={14} />{stock ? 'Sell' : 'Out of stock'}</button></div>}
+      </div>;
+    }) : <div className="empty-state"><Link2 size={22} /><strong>No alternatives yet</strong><span>Add the same OE number to another product to link them.</span></div>}</div>
     <footer className="modal-actions"><span className="helper-text">Prices and availability update with inventory.</span><button className="button button-primary" onClick={onClose}>Done</button></footer>
   </Modal>;
 }
-
 function Login({ onLogin, onRegister }) {
   const [registering, setRegistering] = useState(false);
   const [email, setEmail] = useState('admin@stockroom.local');
@@ -165,6 +173,7 @@ function App() {
   const [photoOrder, setPhotoOrder] = useState(null);
   const [busy, setBusy] = useState(false);
   const [dataError, setDataError] = useState('');
+  const [importProgress, setImportProgress] = useState(null);
   const searchInputRef = useRef(null);
   const canEdit = ROLE_PERMISSIONS[currentUser?.role]?.edit;
   const canManageTeam = ROLE_PERMISSIONS[currentUser?.role]?.team;
@@ -372,23 +381,36 @@ function App() {
   };
   const handleImport = async (file, warehouse, updateMatchingOnly) => {
     setBusy(true); setDataError('');
-    let completed = 0; let inserted = 0; let updated = 0; let skipped = 0; let failed = 0; let firstError = '';
+    let completed = 0; let total = 0; let inserted = 0; let updated = 0; let skipped = 0; let failed = 0; let firstError = '';
     try {
-      const text = await file.text(); const parsed = parseProductCsv(text);
-      for (let start = 0; start < parsed.length; start += 1000) {
+      setImportProgress({ warehouse, stage: 'reading', completed: 0, total: 0, percent: null, message: 'Reading the selected CSV file…' });
+      const text = await file.text();
+      setImportProgress({ warehouse, stage: 'parsing', completed: 0, total: 0, percent: null, message: 'Checking columns and preparing product rows…' });
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const parsed = parseProductCsv(text); total = parsed.length;
+      setImportProgress({ warehouse, stage: 'importing', completed: 0, total, percent: 0, message: `Prepared ${total.toLocaleString()} products. Starting import…`, batch: 0, batches: Math.ceil(total / 1000) });
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      for (let start = 0; start < total; start += 1000) {
         const batch = parsed.slice(start, start + 1000);
-        setDataError(`Importing ${Math.min(start + batch.length, parsed.length).toLocaleString()} of ${parsed.length.toLocaleString()} products…`);
+        setImportProgress({ warehouse, stage: 'importing', completed, total, percent: Math.floor((completed / total) * 100), message: `Saving batch ${Math.floor(start / 1000) + 1} of ${Math.ceil(total / 1000)}…`, batch: Math.floor(start / 1000) + 1, batches: Math.ceil(total / 1000) });
+        await new Promise((resolve) => requestAnimationFrame(resolve));
         let result;
         try { result = await api('/products/import', { method: 'POST', body: JSON.stringify({ warehouse, mode: updateMatchingOnly ? 'update-matching' : 'add-and-update', products: batch }) }); }
-        catch (failure) { throw new Error(`Import stopped after ${completed.toLocaleString()} of ${parsed.length.toLocaleString()} products. ${failure.message}`); }
+        catch (failure) { throw new Error(`Import stopped after ${completed.toLocaleString()} of ${total.toLocaleString()} products. ${failure.message}`); }
         completed += batch.length; inserted += result.inserted; updated += result.updated; skipped += result.skipped || 0; failed += result.failed;
         if (!firstError && result.errors?.length) firstError = `${result.errors[0].sku || `row ${result.errors[0].row}`}: ${result.errors[0].error}`;
+        setImportProgress({ warehouse, stage: 'importing', completed, total, percent: Math.floor((completed / total) * 100), message: `Processed ${completed.toLocaleString()} of ${total.toLocaleString()} products`, batch: Math.floor((start + batch.length - 1) / 1000) + 1, batches: Math.ceil(total / 1000) });
       }
+      setImportProgress({ warehouse, stage: 'finalizing', completed, total, percent: 99, message: 'Import saved. Refreshing inventory totals…', batch: Math.ceil(total / 1000), batches: Math.ceil(total / 1000) });
       const [productResult, summaryResult] = await Promise.all([api(`/products?page=${productPage}&limit=${PRODUCT_PAGE_SIZE}`), api('/products/summary')]);
       setProducts(productResult.items); setProductTotal(productResult.total); setProductSummary(summaryResult);
       setDataError(`${warehouse} import complete: ${inserted.toLocaleString()} added, ${updated.toLocaleString()} matched products updated, ${skipped.toLocaleString()} unmatched SKUs skipped, ${failed.toLocaleString()} failed. Other warehouse stock and user accounts were not changed.${firstError ? ` First issue: ${firstError}` : ''}`);
+      setImportProgress({ warehouse, stage: 'complete', completed: total, total, percent: 100, message: `Import complete · ${total.toLocaleString()} products processed`, batch: Math.ceil(total / 1000), batches: Math.ceil(total / 1000) });
     }
-    catch (failure) { setDataError(failure.message); }
+    catch (failure) {
+      setDataError(failure.message);
+      setImportProgress((current) => ({ warehouse, stage: 'error', completed, total, percent: total ? Math.floor((completed / total) * 100) : null, message: failure.message, batch: current?.batch || 0, batches: current?.batches || (total ? Math.ceil(total / 1000) : 0) }));
+    }
     finally { setBusy(false); }
   };
   const exportProducts = (warehouse, filterBy = '', filterValue = '') => { const params = new URLSearchParams({ warehouse }); if (filterBy) { params.set('filterBy', filterBy); params.set('filterValue', filterValue.trim()); } const anchor = document.createElement('a'); anchor.href = `/api/products/export?${params.toString()}`; document.body.appendChild(anchor); anchor.click(); anchor.remove(); setToast(`${warehouse} ${filterBy ? `${filterBy} filtered` : 'full warehouse'} export started`); };
@@ -430,12 +452,12 @@ function App() {
         {page === 'Website Orders' && ['Admin', 'Store Manager'].includes(currentUser.role) && <WebsiteOrdersPage orders={orders.filter((order) => order.source === 'woocommerce')} busy={busy} connected={wooStatus?.connected} onImport={() => runWooAction('orders/pull')} onAssign={assignWebsiteOrder} />}
         {page === 'Car Check' && ['Admin', 'Store Manager'].includes(currentUser.role) && <CarCheckPage connected={wooStatus?.connected} />}
         {page === 'Reports' && <ReportsPage report={salesReport} onRefresh={loadReports} />}
-        {page === 'Import / export' && <ImportExportPage canManage={canEdit} busy={busy} error={dataError} onImport={handleImport} onExport={exportProducts} />}
+        {page === 'Import / export' && <ImportExportPage canManage={canEdit} busy={busy} error={dataError} progress={importProgress} onImport={handleImport} onExport={exportProducts} />}
         {page === 'WooCommerce' && ['Admin', 'Store Manager'].includes(currentUser.role) && <WooCommercePage status={wooStatus} busy={busy} canImportCatalog={currentUser.role === 'Admin'} onRefresh={loadWooStatus} onAction={runWooAction} onImportOrders={importWebsiteOrders} />}
       </div>
     </main>
     {modalProduct && <ProductForm key={editingProduct?.id || 'new-product'} product={editingProduct || null} racks={racks} onClose={() => setModalProduct(null)} onSave={saveProduct} />}
-    {altProduct && <AlternativesModal product={altProduct.product} products={altProduct.products} onClose={() => setAltProduct(null)} />}
+    {altProduct && <AlternativesModal product={altProduct.product} products={altProduct.products} onClose={() => setAltProduct(null)} onSell={openQuickSell} canSell={canEdit} />}
     {orderModalOpen && <CreateOrderModal products={products} packers={packers} loading={packerLoading} initialWarehouse={currentUser.warehouse || 'KG'} onWarehouseChange={loadPackers} onClose={() => setOrderModalOpen(false)} onSave={createOrder} />}
     {quickSellProduct && <QuickSaleModal key={quickSellProduct.id} product={quickSellProduct} packers={packers} loading={packerLoading} onWarehouseChange={loadPackers} onClose={() => setQuickSellProduct(null)} onSave={createQuickSale} />}
     {invoiceOrder && <InvoiceModal order={invoiceOrder} onClose={() => setInvoiceOrder(null)} />}
@@ -446,9 +468,9 @@ function App() {
 }
 
 function InventoryTable({ products, allProducts, warehouseFilter, canEdit, page, pageSize, total, onPageChange, searching, onEdit, onAlternatives, onSell, onDelete }) {
-  return <section className="table-region"><div className="table-scroll"><table className="inventory-table"><thead><tr><th>Product</th><th>SKU</th><th>Brand</th><th>OE number</th><th>Available</th><th>Location</th><th>Barcode</th><th>Actions</th></tr></thead><tbody>{products.map((product) => { const qty = availableFor(product, warehouseFilter); return <tr key={product.id}>
+  return <section className="table-region"><div className="table-scroll"><table className="inventory-table"><colgroup><col className="inventory-col-product" /><col className="inventory-col-sku" /><col className="inventory-col-brand" /><col className="inventory-col-oe" /><col className="inventory-col-available" /><col className="inventory-col-location" /><col className="inventory-col-barcode" /><col className="inventory-col-actions" /></colgroup><thead><tr><th>Product</th><th>SKU</th><th>Brand</th><th>OE number</th><th>Available</th><th>Location</th><th>Barcode</th><th>Actions</th></tr></thead><tbody>{products.map((product) => { const qty = availableFor(product, warehouseFilter); return <tr key={product.id}>
     <td className="product-cell"><button className="product-name" onClick={() => canEdit && onEdit(product)}>{product.name}</button>{allProducts.some((other) => other.id !== product.id && other.oe.some((oe) => product.oe.includes(oe))) && <button className="alt-link" onClick={() => onAlternatives(product, allProducts)}>{allProducts.filter((p) => p.id !== product.id && p.oe.some((oe) => product.oe.includes(oe))).length} alternatives <ChevronRight size={13} /></button>}</td>
-    <td className="mono">{product.sku}</td><td>{product.brand}</td><td className="mono oe-value">{product.oe.join(', ') || '—'}</td><td><span className={`quantity ${qty === 0 ? 'qty-zero' : qty <= 5 ? 'qty-low' : 'qty-good'}`}>{qty} {product.unit || 'PCS'}</span>{qty > 0 && qty <= 5 && <span className="low-note">Low stock</span>}</td><td className="location-cell">{product.locations.filter((loc) => warehouseFilter === 'all' || loc.warehouse === warehouseFilter).map((loc) => <span key={`${loc.warehouse}-${loc.rack}`}>{loc.warehouse ? <><b>{loc.warehouse}</b>{loc.rack && <> ? {loc.rack}</>}</> : loc.rack}</span>)}</td><td><BarcodeMark value={product.barcode} compact /></td><td className="inventory-actions">{canEdit && <button className="row-action sell-action" onClick={() => onSell(product)} title={`Sell ${product.name}`}><ShoppingCart size={15} /><span>Sell</span></button>}<button className="row-action icon-button" onClick={() => onAlternatives(product, allProducts)} title="View OE alternatives" aria-label={`Compare alternatives for ${product.name}`}><ArrowDownUp size={15} /></button>{canEdit && <button className="row-action delete-action" onClick={() => onDelete(product)} title={`Delete ${product.name}`} aria-label={`Delete ${product.name}`}><Trash2 size={15} /></button>}</td>
+    <td className="mono sku-cell" title={product.sku}>{product.sku}</td><td className="brand-cell" title={product.brand}>{product.brand}</td><td className="mono oe-value" title={product.oe.join(", ")}>{product.oe.join(', ') || '—'}</td><td><span className={`quantity ${qty === 0 ? 'qty-zero' : qty <= 5 ? 'qty-low' : 'qty-good'}`}>{qty} {product.unit || 'PCS'}</span>{qty > 0 && qty <= 5 && <span className="low-note">Low stock</span>}</td><td className="location-cell">{product.locations.filter((loc) => warehouseFilter === 'all' || loc.warehouse === warehouseFilter).map((loc) => <span key={`${loc.warehouse}-${loc.rack}`}>{loc.warehouse ? <><b>{loc.warehouse}</b>{loc.rack && <> ? {loc.rack}</>}</> : loc.rack}</span>)}</td><td><BarcodeMark value={product.barcode} compact /></td><td className="inventory-actions">{canEdit && <button className="row-action sell-action" onClick={() => onSell(product)} title={`Sell ${product.name}`}><ShoppingCart size={15} /><span>Sell</span></button>}<button className="row-action icon-button" onClick={() => onAlternatives(product, allProducts)} title="View OE alternatives" aria-label={`Compare alternatives for ${product.name}`}><ArrowDownUp size={15} /></button>{canEdit && <button className="row-action delete-action" onClick={() => onDelete(product)} title={`Delete ${product.name}`} aria-label={`Delete ${product.name}`}><Trash2 size={15} /></button>}</td>
   </tr>; })}{!products.length && <tr><td className="no-results" colSpan="8"><Search size={20} /><strong>No matching products</strong><span>Try a different SKU, OE number, barcode or warehouse filter.</span></td></tr>}</tbody></table></div><footer className="table-footer"><span>Showing <strong>{total ? `${((page - 1) * pageSize + 1).toLocaleString('en-IN')} to ${Math.min(page * pageSize, total).toLocaleString('en-IN')}` : '0'}</strong> of <strong>{total.toLocaleString('en-IN')}</strong> products{searching ? ' matching search' : ''}</span><div className="pagination"><button className="page-arrow" disabled={page <= 1} aria-label="Previous page" onClick={() => onPageChange((value) => Math.max(1, value - 1))}><ChevronLeft size={17} /></button><button className="page-current">{page}</button><button className="page-arrow" disabled={page * pageSize >= total} aria-label="Next page" onClick={() => onPageChange((value) => value + 1)}><ChevronRight size={17} /></button></div></footer></section>;
 }
 
@@ -582,7 +604,27 @@ function compressPhoto(file) {
     reader.onerror = () => reject(new Error('Could not read this photo.'));
     reader.onload = () => {
       const image = new Image(); image.onerror = () => reject(new Error('This file is not a supported image.'));
-      image.onload = () => { const scale = Math.min(1, 1440 / Math.max(image.width, image.height)); const canvas = document.createElement('canvas'); canvas.width = Math.round(image.width * scale); canvas.height = Math.round(image.height * scale); canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height); resolve(canvas.toDataURL('image/jpeg', 0.78)); };
+      image.onload = () => {
+        const maxEdge = 1200;
+        const scale = Math.min(1, maxEdge / Math.max(image.width, image.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        const context = canvas.getContext('2d');
+        if (!context) return reject(new Error('This browser could not prepare the photo.'));
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const readBlob = (blob) => {
+          if (!blob) return reject(new Error('Could not compress this photo. Try another image.'));
+          const output = new FileReader();
+          output.onerror = () => reject(new Error('Could not prepare the compressed photo for upload.'));
+          output.onload = () => resolve(String(output.result));
+          output.readAsDataURL(blob);
+        };
+        canvas.toBlob((webp) => {
+          if (webp?.type === 'image/webp') return readBlob(webp);
+          canvas.toBlob(readBlob, 'image/jpeg', 0.65);
+        }, 'image/webp', 0.65);
+      };
       image.src = String(reader.result);
     };
     reader.readAsDataURL(file);
@@ -715,7 +757,7 @@ function ReportsPage({ report, onRefresh }) {
   return <><section className="page-heading"><div><h1>Sales reports</h1><p>Revenue and top moving car parts from the last 30 days.</p></div><button className="button button-quiet" onClick={onRefresh}><Activity size={15} /> Refresh report</button></section><div className="order-summary report-summary"><div><span>Sales revenue</span><strong>{fmt(report?.revenue || 0)}</strong></div><div><span>Fulfilled orders</span><strong>{report?.orderCount || 0}</strong></div><div><span>Units sold</span><strong>{report?.itemsSold || 0}</strong></div><div><span>Top SKU</span><strong className="best-seller-value">{report?.bestSellers?.[0]?.sku || '—'}</strong></div></div><section className="report-section"><div className="section-title"><div><h2>Best products in sales</h2><p>Ranked by units sold in fulfilled orders.</p></div></div>{report?.bestSellers?.length ? <div className="seller-list">{report.bestSellers.map((item, index) => <div className="seller-row" key={item.sku}><span className="seller-rank">{String(index + 1).padStart(2, '0')}</span><div className="seller-main"><strong>{item.name}</strong><small>{item.sku}</small><div className="seller-track"><i style={{ width: `${item.units / maxUnits * 100}%` }} /></div></div><div className="seller-units"><strong>{item.units}</strong><small>units</small></div><div className="seller-revenue">{fmt(item.revenue)}</div></div>)}</div> : <div className="empty-state"><BarChart3 size={22} /><strong>No sales data yet</strong><span>Reports populate after orders are packed and fulfilled.</span></div>}</section></>;
 }
 
-function ImportExportPage({ canManage, busy, error, onImport, onExport }) {
+function ImportExportPage({ canManage, busy, error, progress, onImport, onExport }) {
   const fileRef = useRef(null); const selectedWarehouse = useRef('KG'); const [updateMatchingOnly, setUpdateMatchingOnly] = useState(false);
   const warehouseList = [{ code: 'KG', name: 'Kashmiri Gate' }, { code: 'SPB', name: 'Samaypur Badli' }, { code: 'BG', name: 'Bangalore' }, { code: 'PB', name: 'Palika Bazaar' }];
   const [exportFilters, setExportFilters] = useState(() => Object.fromEntries(warehouseList.map(({ code }) => [code, { type: 'category', value: '' }])));
@@ -723,6 +765,8 @@ function ImportExportPage({ canManage, busy, error, onImport, onExport }) {
   return <><section className="page-heading"><div><h1>Warehouse data</h1><p>Import and export each warehouse independently. Stock changes stay scoped to the selected location.</p></div></section>
     <input ref={fileRef} type="file" accept=".csv,text/csv" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) onImport(file, selectedWarehouse.current, updateMatchingOnly); event.target.value = ''; }} />
     <section className="import-mode-panel"><div><strong>When a SKU already exists</strong><span>Choose whether this import may add new catalog items.</span></div><label><input type="checkbox" checked={updateMatchingOnly} onChange={(event) => setUpdateMatchingOnly(event.target.checked)} disabled={busy} /><span><b>Update matching SKUs only</b><small>Update product fields present in the CSV and this warehouse’s stock. Skip SKUs that are not in inventory.</small></span></label></section>
+    {progress && <section className={`import-progress-panel import-progress-${progress.stage}`} role="status" aria-live="polite"><div className="import-progress-heading"><div><strong>{progress.stage === 'error' ? `${progress.warehouse} import stopped` : `${progress.warehouse} inventory import`}</strong><span>{progress.message}</span></div><b>{progress.percent == null ? 'Working…' : `${progress.percent}%`}</b></div><progress className="import-progress-bar" max="100" value={progress.percent == null ? undefined : progress.percent} aria-label={`${progress.warehouse} inventory import progress`} /><div className="import-progress-meta"><span>{progress.total ? `${progress.completed.toLocaleString()} of ${progress.total.toLocaleString()} products processed` : 'Preparing file for import'}</span>{progress.batches > 0 && <span>Batch {progress.batch} of {progress.batches}</span>}</div></section>}
+    {error && <div className={`import-result ${progress?.stage === 'error' ? 'import-result-error' : ''}`} role="status">{progress?.stage === 'complete' && <Check size={16} />}{error}</div>}
     <div className="warehouse-import-grid">{warehouseList.map(({ code, name }) => <article className="warehouse-import-card" key={code}>
       <div className="warehouse-import-head"><span className="warehouse-import-code">{code}</span><div><h2>{name}</h2><p>Warehouse stock file</p></div></div>
       <div className="warehouse-import-detail"><strong>{updateMatchingOnly ? 'Update matching only' : 'Add new and update matching'}</strong><span>{updateMatchingOnly ? `Updates matching SKUs and skips unknown ones. Only ${code} stock locations are changed.` : `Adds new SKUs and updates matching ${code} stock locations.`} Other warehouse stock and user accounts stay unchanged.</span></div>
@@ -730,7 +774,7 @@ function ImportExportPage({ canManage, busy, error, onImport, onExport }) {
       <div className="warehouse-filter-export"><label><span>Filtered export</span><select value={exportFilters[code].type} disabled={!canManage || busy} onChange={(event) => updateExportFilter(code, 'type', event.target.value)}><option value="category">By category</option><option value="brand">By brand</option><option value="oe">By OE number</option></select></label><input aria-label={`${code} export filter value`} value={exportFilters[code].value} disabled={!canManage || busy} onChange={(event) => updateExportFilter(code, 'value', event.target.value)} placeholder={`Exact ${exportFilters[code].type === 'oe' ? 'OE number' : exportFilters[code].type}`} /><button className="button button-quiet" disabled={!canManage || busy || !exportFilters[code].value.trim()} onClick={() => onExport(code, exportFilters[code].type, exportFilters[code].value)}><FileDown size={14} /> Export filtered</button></div>
     </article>)}</div>
     <div className="warehouse-import-note"><Shield size={16} /><p>Full and filtered exports download as CSV, one row per SKU and rack. Category, brand, and OE filters match exact values and only include stock from the selected warehouse. Large exports stream from the server without loading the full stock file into the app.</p></div>
-    {error && <div className={`import-result ${busy ? 'import-progress' : ''}`} role="status">{!busy && <Check size={16} />}{error}</div>}{!canManage && <p className="permission-note"><Shield size={15} /> Only Admins and Store Managers can import or export warehouse stock.</p>}</>;
+    {!canManage && <p className="permission-note"><Shield size={15} /> Only Admins and Store Managers can import or export warehouse stock.</p>}</>;
 }
 function WooCommercePage({ status, busy, canImportCatalog, onRefresh, onAction, onImportOrders }) {
   const configured = status?.configured; const connected = status?.connected;

@@ -218,6 +218,16 @@ function photoMetadata(photo) {
   return { id, orderId: photo.orderId, productId: photo.productId, sku: photo.sku, productName: photo.productName, warehouse: photo.warehouse, packerId: photo.packerId, packerName: photo.packerName, keep: Boolean(photo.keep), expiresAt: photo.expiresAt ? new Date(photo.expiresAt).toISOString() : null, createdAt: photo.createdAt ? new Date(photo.createdAt).toISOString() : new Date().toISOString(), imageUrl: `/api/packing-photos/${encodeURIComponent(id)}/image` };
 }
 
+function photoImageBuffer(image) {
+  if (Buffer.isBuffer(image)) return image;
+  if (Buffer.isBuffer(image?.buffer)) return Buffer.from(image.buffer.subarray(0, image.position ?? image.buffer.length));
+  if (typeof image?.value === 'function') {
+    const value = image.value(true);
+    if (Buffer.isBuffer(value)) return value;
+  }
+  return Buffer.alloc(0);
+}
+
 async function findAccessibleOrder(orderId, user) {
   const order = dataSource === 'mongodb' ? await Order.findById(orderId).lean() : demoOrders.find((item) => item.id === orderId);
   if (!order) return null;
@@ -1279,7 +1289,9 @@ app.get('/api/packing-photos/:id/image', requireAuth, async (request, response, 
     const order = await findAccessibleOrder(photo.orderId, request.user);
     if (!order) return response.status(404).json({ error: 'Packing photo not found.' });
     response.setHeader('Content-Type', photo.mimeType); response.setHeader('Cache-Control', 'private, no-store'); response.setHeader('X-Content-Type-Options', 'nosniff');
-    return response.send(dataSource === 'mongodb' ? photo.image : Buffer.from(photo.imageData.split(',')[1], 'base64'));
+    const image = dataSource === 'mongodb' ? photoImageBuffer(photo.image) : Buffer.from(photo.imageData.split(',')[1], 'base64');
+    if (!image.length) return response.status(500).json({ error: 'Packing photo data is empty or unreadable.' });
+    return response.send(image);
   } catch (error) { return next(error); }
 });
 
