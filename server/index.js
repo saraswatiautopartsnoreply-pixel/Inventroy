@@ -4,10 +4,10 @@ import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import mongoose from 'mongoose';
 import { createClient } from 'redis';
-import { rateLimit } from 'express-rate-limit';
+import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import { SignJWT, jwtVerify } from 'jose';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +15,9 @@ import { demoProducts, demoUsers } from '../src/data.js';
 import { Product } from './models/Product.js';
 import { User } from './models/User.js';
 import { Order } from './models/Order.js';
+import { PaymentLink } from './models/PaymentLink.js';
 import { Rack } from './models/Rack.js';
+import { SystemSetting } from './models/SystemSetting.js';
 import { PackingPhoto } from './models/PackingPhoto.js';
 import { PushSubscription } from './models/PushSubscription.js';
 import { ActivityEvent } from './models/ActivityEvent.js';
@@ -28,6 +30,8 @@ const port = Number(process.env.PORT || process.env.API_PORT || 4000);
 const host = process.env.API_HOST || (production ? '0.0.0.0' : '127.0.0.1');
 const appDirectory = path.dirname(fileURLToPath(import.meta.url));
 const cacheTtlSeconds = Number(process.env.SEARCH_CACHE_TTL_SECONDS || 15);
+const productCacheVersionKey = 'stockroom:cache:products:version';
+const productQueryCacheSeconds = Math.max(5, Number(process.env.PRODUCT_CACHE_TTL_SECONDS || 15));
 const sessionSecret = process.env.SESSION_SECRET || 'local-demo-session-secret-change-before-deploy';
 const sessionKey = new TextEncoder().encode(sessionSecret);
 const sessionCookie = 'stockroom_session';
@@ -36,11 +40,14 @@ let redisClient = null;
 let demoProductStore = structuredClone(demoProducts).map((product) => ({ ...product, locations: product.locations.map((location) => ({ ...location, reserved: 0 })) }));
 let demoUserStore = structuredClone(demoUsers);
 let demoOrders = [];
+let demoPaymentLinks = [];
 let demoRackStore = [];
 let demoPackingPhotos = [];
 let demoPushSubscriptions = [];
 let demoActivityEvents = [];
 let demoUserSessions = [];
+let demoSystemSettings = { allowZeroStockSales: true };
+const cacheFlights = new Map();
 const photoRetentionMs = 7 * 24 * 60 * 60 * 1000;
 const auditRetentionDays = 210;
 const auditRetentionMs = auditRetentionDays * 24 * 60 * 60 * 1000;
@@ -59,9 +66,18 @@ if (production && (Buffer.byteLength(sessionSecret) < 32 || process.env.BOOTSTRA
 
 app.disable('x-powered-by');
 app.use(helmet({ contentSecurityPolicy: { directives: { imgSrc: ["'self'", 'data:', 'https:'] } } }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '2mb', verify: (request, _response, buffer) => { request.rawBody = Buffer.from(buffer); } }));
 app.use(cookieParser());
-app.use('/api/', rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-8', legacyHeaders: false }));
+app.use('/api/', rateLimit({
+  windowMs: 60_000,
+  limit: 600,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  keyGenerator: (request) => {
+    const token = request.cookies?.[sessionCookie];
+    return token ? `session:${createHash('sha256').update(token).digest('hex')}` : `ip:${ipKeyGenerator(request.ip)}`;
+  },
+}));
 
 const roleRank = { Packer: 1, 'Store Manager': 2, Admin: 3 };
 const canManage = (user) => roleRank[user?.role] >= roleRank['Store Manager'];
@@ -69,7 +85,59 @@ const isAdmin = (user) => user?.role === 'Admin';
 const cleanUser = (user) => ({ id: String(user._id || user.id), name: user.name, phone: user.phone || '', email: user.email, role: user.role, warehouse: user.warehouse || '', approved: user.approved !== false, active: user.active !== false });
 const asDate = (value) => value ? new Date(value) : new Date();
 
+async function loadSystemSettings() {
+  if (dataSource !== 'mongodb') return { ...demoSystemSettings };
+  try {
+    const settings = await SystemSetting.findOneAndUpdate(
+      { key: 'global' },
+      { $setOnInsert: { allowZeroStockSales: true } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean();
+    return { allowZeroStockSales: settings.allowZeroStockSales !== false };
+  } catch (error) {
+    if (error.code === 11000) {
+      const settings = await SystemSetting.findOne({ key: 'global' }).lean();
+      if (settings) return { allowZeroStockSales: settings.allowZeroStockSales !== false };
+    }
+    throw error;
+  }
+}
+
+function getIntegrationConfig() {
+  return {
+    wooCommerce: {
+      url: String(process.env.WOOCOMMERCE_URL || '').trim().replace(/\/$/, ''),
+      consumerKey: process.env.WOOCOMMERCE_CONSUMER_KEY || '',
+      consumerSecret: process.env.WOOCOMMERCE_CONSUMER_SECRET || '',
+      defaultWarehouse: process.env.WOOCOMMERCE_DEFAULT_WAREHOUSE || 'KG',
+      defaultRack: process.env.WOOCOMMERCE_DEFAULT_RACK || 'G-1A',
+    },
+    razorpay: {
+      keyId: process.env.RAZORPAY_KEY_ID || '',
+      keySecret: process.env.RAZORPAY_KEY_SECRET || '',
+      webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || '',
+    },
+  };
+}
+
+function publicIntegrationSettings(config) {
+  return {
+    wooCommerce: { configured: Boolean(config.wooCommerce.url && config.wooCommerce.consumerKey && config.wooCommerce.consumerSecret), url: config.wooCommerce.url, defaultWarehouse: config.wooCommerce.defaultWarehouse, defaultRack: config.wooCommerce.defaultRack },
+    razorpay: { configured: Boolean(config.razorpay.keyId && config.razorpay.keySecret), webhookConfigured: Boolean(config.razorpay.webhookSecret), mode: config.razorpay.keyId.startsWith('rzp_live_') ? 'live' : 'test' },
+  };
+}
+
 function escapeRegex(value) { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Treat spaces and common part-number separators as formatting, so e.g. AU-BS101
+// and AUBS101 resolve to the same search term without changing stored SKUs/OEs.
+function normalizeSearchValue(value) { return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+function flexibleSearchRegex(value, exact = false) {
+  const characters = [...normalizeSearchValue(value)];
+  if (!characters.length) return null;
+  const pattern = characters.map(escapeRegex).join('[^A-Z0-9]*');
+  return new RegExp(`${exact ? '^' : ''}${pattern}${exact ? '$' : ''}`, 'i');
+}
 
 function normalizeProduct(product) {
   const value = typeof product.toObject === 'function' ? product.toObject() : product;
@@ -206,11 +274,8 @@ async function findProductBySku(sku, session) {
 
 async function invalidateSearchCache() {
   if (!redisClient?.isReady) return;
-  try {
-    const keys = [];
-    for await (const key of redisClient.scanIterator({ MATCH: 'stockroom:search:v1:*', COUNT: 100 })) keys.push(key);
-    if (keys.length) await redisClient.del(keys);
-  } catch (error) { console.warn('Search cache invalidation failed:', error.message); }
+  try { await redisClient.incr(productCacheVersionKey); }
+  catch (error) { console.warn('Product cache invalidation failed:', error.message); }
 }
 
 function photoMetadata(photo) {
@@ -257,16 +322,36 @@ async function notifyPacker(user, order) {
   }));
 }
 
-async function readSearchCache(key) {
+async function readJsonCache(key) {
   if (!redisClient?.isReady) return null;
   try { const value = await redisClient.get(key); return value ? JSON.parse(value) : null; }
-  catch (error) { console.warn('Search cache read failed:', error.message); return null; }
+  catch (error) { console.warn('Redis cache read failed:', error.message); return null; }
 }
 
-async function writeSearchCache(key, value) {
+async function writeJsonCache(key, value, ttlSeconds = cacheTtlSeconds) {
   if (!redisClient?.isReady) return;
-  try { await redisClient.set(key, JSON.stringify(value), { EX: cacheTtlSeconds }); }
-  catch (error) { console.warn('Search cache write failed:', error.message); }
+  try { await redisClient.set(key, JSON.stringify(value), { EX: ttlSeconds }); }
+  catch (error) { console.warn('Redis cache write failed:', error.message); }
+}
+
+async function getProductCacheVersion() {
+  if (!redisClient?.isReady) return 'local';
+  try { return (await redisClient.get(productCacheVersionKey)) || '0'; }
+  catch (error) { console.warn('Product cache version read failed:', error.message); return 'uncached'; }
+}
+
+async function cachedJson(key, ttlSeconds, load) {
+  const cached = await readJsonCache(key);
+  if (cached !== null) return { value: cached, cached: true };
+  if (cacheFlights.has(key)) return { value: await cacheFlights.get(key), cached: true };
+  const request = (async () => {
+    const value = await load();
+    await writeJsonCache(key, value, ttlSeconds);
+    return value;
+  })();
+  cacheFlights.set(key, request);
+  try { return { value: await request, cached: false }; }
+  finally { if (cacheFlights.get(key) === request) cacheFlights.delete(key); }
 }
 
 function validateProduct(input) {
@@ -304,6 +389,12 @@ function validateProduct(input) {
 function preserveReservedStock(existing, updated) {
   if (!updated.locations.length) updated.locations = (existing.locations || []).map((location) => ({ warehouse: location.warehouse, rack: location.rack, qty: location.qty, reserved: location.reserved || 0 }));
   for (const oldLocation of existing.locations || []) {
+    if (oldLocation.rack !== 'BACKORDER') continue;
+    if (!updated.locations.some((location) => location.warehouse === oldLocation.warehouse && location.rack === 'BACKORDER')) {
+      updated.locations.push({ warehouse: oldLocation.warehouse, rack: 'BACKORDER', qty: oldLocation.qty, reserved: 0 });
+    }
+  }
+  for (const oldLocation of existing.locations || []) {
     const reserved = Number(oldLocation.reserved || 0);
     if (!reserved) continue;
     const replacement = updated.locations.find((location) => location.warehouse === oldLocation.warehouse && location.rack === oldLocation.rack);
@@ -337,7 +428,41 @@ function allocateFromProduct(product, quantity, warehouse) {
   return allocations;
 }
 
-async function reserveOrder(orderId, user) {
+function applyOrderReservation(product, item, warehouse, allowZeroStockSales) {
+  const netAvailable = Math.max(0, product.locations
+    .filter((location) => location.warehouse === warehouse)
+    .reduce((sum, location) => sum + Number(location.qty || 0) - Number(location.reserved || 0), 0));
+  const reserveQuantity = Math.min(item.quantity, netAvailable);
+  const backorderedQuantity = item.quantity - reserveQuantity;
+  if (backorderedQuantity > 0 && !allowZeroStockSales) throw Object.assign(new Error(`${item.sku} does not have enough available stock at ${warehouse}.`), { status: 409 });
+  const allocations = reserveQuantity ? allocateFromProduct(product, reserveQuantity, warehouse) : [];
+  for (const allocation of allocations) {
+    const location = product.locations.find((entry) => entry.warehouse === allocation.warehouse && entry.rack === allocation.rack);
+    location.reserved += allocation.quantity;
+  }
+  if (backorderedQuantity > 0) {
+    let backorderLocation = product.locations.find((location) => location.warehouse === warehouse && location.rack === 'BACKORDER');
+    if (!backorderLocation) {
+      backorderLocation = { warehouse, rack: 'BACKORDER', qty: 0, reserved: 0 };
+      product.locations.push(backorderLocation);
+    }
+    backorderLocation.qty -= backorderedQuantity;
+  }
+  item.allocations = allocations;
+  item.backorderedQuantity = backorderedQuantity;
+}
+
+function restoreBackorderedStock(product, item, warehouse) {
+  const quantity = Number(item.backorderedQuantity || 0);
+  if (!quantity) return;
+  const location = product.locations.find((entry) => entry.warehouse === warehouse && entry.rack === 'BACKORDER');
+  if (!location) return;
+  location.qty += quantity;
+  if (location.qty === 0) product.locations = product.locations.filter((entry) => entry !== location);
+  item.backorderedQuantity = 0;
+}
+
+async function reserveOrder(orderId, user, allowZeroStockSales = false) {
   const unreservedSkus = [];
   const session = await mongoose.startSession();
   try {
@@ -351,14 +476,8 @@ async function reserveOrder(orderId, user) {
         if (!item.productId || item.allocations?.length) continue;
         const product = await Product.findById(item.productId).session(session);
         if (!product) { unreservedSkus.push(item.sku); continue; }
-        let allocations;
-        try { allocations = allocateFromProduct(product, item.quantity, order.warehouse); }
+        try { applyOrderReservation(product, item, order.warehouse, allowZeroStockSales); }
         catch (error) { if (error.status !== 409) throw error; unreservedSkus.push(item.sku); continue; }
-        for (const allocation of allocations) {
-          const location = product.locations.find((entry) => entry.warehouse === allocation.warehouse && entry.rack === allocation.rack);
-          location.reserved += allocation.quantity;
-        }
-        item.allocations = allocations;
         await product.save({ session });
       }
       if (unreservedSkus.length) order.notes = `Stock was not reserved for unmapped or unavailable items: ${[...new Set(unreservedSkus)].join(', ')}`;
@@ -370,7 +489,7 @@ async function reserveOrder(orderId, user) {
   } finally { await session.endSession(); }
 }
 
-async function createAssignedOrder(orderData, user) {
+async function createAssignedOrder(orderData, user, allowZeroStockSales) {
   const session = await mongoose.startSession();
   try {
     let result;
@@ -379,12 +498,7 @@ async function createAssignedOrder(orderData, user) {
       for (const item of order.items) {
         const product = await Product.findById(item.productId).session(session);
         if (!product) throw Object.assign(new Error(`Product ${item.sku} no longer exists.`), { status: 409 });
-        const allocations = allocateFromProduct(product, item.quantity, order.warehouse);
-        for (const allocation of allocations) {
-          const location = product.locations.find((entry) => entry.warehouse === allocation.warehouse && entry.rack === allocation.rack);
-          location.reserved += allocation.quantity;
-        }
-        item.allocations = allocations;
+        applyOrderReservation(product, item, order.warehouse, allowZeroStockSales);
         await product.save({ session });
       }
       order.status = 'accepted'; order.assignedTo = user.id; order.assignedName = user.name;
@@ -397,19 +511,13 @@ async function createAssignedOrder(orderData, user) {
   } finally { await session.endSession(); }
 }
 
-function reserveDemoOrder(order, user) {
+function reserveDemoOrder(order, user, allowZeroStockSales = false) {
   const unreservedSkus = [];
   for (const item of order.items) {
     if (item.allocations?.length) continue;
     const product = demoProductStore.find((entry) => entry.sku === item.sku);
     if (!product) { unreservedSkus.push(item.sku); continue; }
-    try {
-      item.allocations = allocateFromProduct(product, item.quantity, order.warehouse);
-      for (const allocation of item.allocations) {
-        const location = product.locations.find((entry) => entry.warehouse === allocation.warehouse && entry.rack === allocation.rack);
-        if (location) location.reserved = Number(location.reserved || 0) + allocation.quantity;
-      }
-    }
+    try { applyOrderReservation(product, item, order.warehouse, allowZeroStockSales); }
     catch (error) { if (error.status !== 409) throw error; unreservedSkus.push(item.sku); }
   }
   if (unreservedSkus.length) order.notes = `Stock was not reserved for unmapped or unavailable items: ${[...new Set(unreservedSkus)].join(', ')}`;
@@ -430,6 +538,7 @@ async function updateOrderStatus(orderId, target, user) {
       if (target === 'cancelled') {
         if (['packed', 'shipped', 'completed', 'cancelled'].includes(order.status)) throw Object.assign(new Error('This order cannot be cancelled at its current stage.'), { status: 409 });
         if (['accepted', 'packing'].includes(order.status)) await adjustReservations(order, -1, session);
+        await restoreOrderBackorders(order, session);
       } else if (!(transitions[order.status] || []).includes(target)) {
         throw Object.assign(new Error(`Cannot move an order from ${order.status} to ${target}.`), { status: 409 });
       }
@@ -453,6 +562,16 @@ async function adjustReservations(order, direction, session) {
       const location = product.locations.find((entry) => entry.warehouse === allocation.warehouse && entry.rack === allocation.rack);
       if (location) location.reserved = Math.max(0, location.reserved + (allocation.quantity * direction));
     }
+    await product.save({ session });
+  }
+}
+
+async function restoreOrderBackorders(order, session) {
+  for (const item of order.items) {
+    if (!item.productId || !Number(item.backorderedQuantity || 0)) continue;
+    const product = await Product.findById(item.productId).session(session);
+    if (!product) continue;
+    restoreBackorderedStock(product, item, order.warehouse);
     await product.save({ session });
   }
 }
@@ -489,19 +608,19 @@ function cancelDemoReservation(order) {
       const location = product?.locations.find((entry) => entry.warehouse === allocation.warehouse && entry.rack === allocation.rack);
       if (location) location.reserved = Math.max(0, Number(location.reserved || 0) - allocation.quantity);
     }
+    if (product) restoreBackorderedStock(product, item, order.warehouse);
   }
 }
 
-function getWooConfig() {
-  const url = String(process.env.WOOCOMMERCE_URL || '').trim().replace(/\/$/, '');
-  const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY;
-  const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET;
+async function getWooConfig() {
+  const { wooCommerce: config } = await getIntegrationConfig();
+  const { url, consumerKey, consumerSecret } = config;
   if (!url || !consumerKey || !consumerSecret) throw Object.assign(new Error('WooCommerce URL and REST API credentials are not configured.'), { status: 503 });
   return { url, authorization: `Basic ${Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64')}` };
 }
 
 async function wooRequest(path, options = {}) {
-  const config = getWooConfig();
+  const config = await getWooConfig();
   const response = await fetch(`${config.url}/wp-json/wc/v3/${path}`, {
     ...options, signal: AbortSignal.timeout(20_000),
     headers: { Authorization: config.authorization, Accept: 'application/json', 'Content-Type': 'application/json', ...(options.headers || {}) },
@@ -541,7 +660,7 @@ function normalizeWooCatalogProduct(item) {
 }
 
 async function wooYmmRequest(path) {
-  const { url } = getWooConfig();
+  const { url } = await getWooConfig();
   const response = await fetch(`${url}/wp-json/saraswati/v1/ymm/${path}`, { signal: AbortSignal.timeout(20_000), headers: { Accept: 'application/json' } });
   const result = await response.json().catch(() => null);
   if (!response.ok) throw Object.assign(new Error(response.status === 404 ? 'The YMM data connector is not installed on WordPress yet. Install wordpress/saraswati-ymm-rest.php, then try again.' : `WordPress YMM lookup returned ${response.status}: ${result?.message || 'Check the YMM data connector.'}`), { status: 502 });
@@ -553,7 +672,205 @@ app.get('/api/health', (_request, response) => {
   response.status(ready || !production ? 200 : 503).json({ ok: ready || !production, source: dataSource, cache: redisClient?.isReady ? 'ready' : 'disabled' });
 });
 
-const loginLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 15, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Try again later.' } });
+app.get('/api/settings', requireAuth, requireManager, async (_request, response, next) => {
+  try { return response.json({ settings: await loadSystemSettings() }); }
+  catch (error) { return next(error); }
+});
+
+app.patch('/api/settings', requireAuth, requireAdmin, async (request, response, next) => {
+  try {
+    if (typeof request.body.allowZeroStockSales !== 'boolean') return response.status(400).json({ error: 'Choose whether zero-stock sales are allowed.' });
+    let settings;
+    if (dataSource === 'mongodb') {
+      const saved = await SystemSetting.findOneAndUpdate(
+        { key: 'global' },
+        { $set: { allowZeroStockSales: request.body.allowZeroStockSales } },
+        { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true },
+      ).lean();
+      settings = { allowZeroStockSales: saved.allowZeroStockSales !== false };
+    } else {
+      demoSystemSettings = { ...demoSystemSettings, allowZeroStockSales: request.body.allowZeroStockSales };
+      settings = { ...demoSystemSettings };
+    }
+    return response.json({ settings });
+  } catch (error) { return next(error); }
+});
+
+app.get('/api/payments/razorpay/status', requireAuth, requireManager, async (_request, response, next) => {
+  try { return response.json({ razorpay: publicIntegrationSettings(await getIntegrationConfig()).razorpay }); }
+  catch (error) { return next(error); }
+});
+
+app.post('/api/orders/:id/payment-link', requireAuth, requireManager, async (request, response, next) => {
+  try {
+    const { razorpay: { keyId, keySecret } } = await getIntegrationConfig();
+    if (!keyId || !keySecret) return response.status(503).json({ error: 'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to the server .env file, then restart the server.' });
+    const order = dataSource === 'mongodb'
+      ? await Order.findById(request.params.id)
+      : demoOrders.find((item) => item.id === request.params.id);
+    if (!order) return response.status(404).json({ error: 'Order not found.' });
+    const current = typeof order.toObject === 'function' ? order.toObject() : order;
+    const due = Math.max(0, Number(current.balanceDue ?? (Number(current.total || 0) - Number(current.amountPaid || 0))));
+    if (due <= 0) return response.status(409).json({ error: 'This order has no balance due.' });
+    if (current.paymentLink?.url && ['created', 'partially_paid'].includes(current.paymentLink.status)) {
+      return response.json({ order: normalizeOrder(order), paymentLink: current.paymentLink, reused: true });
+    }
+    const amountPaise = Math.round(due * 100);
+    const razorpayResponse = await fetch('https://api.razorpay.com/v1/payment_links', {
+      method: 'POST',
+      headers: { Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString('base64')}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        amount: amountPaise,
+        currency: 'INR',
+        accept_partial: false,
+        reference_id: String(current.orderNumber).slice(0, 40),
+        description: `Payment for inventory order ${current.orderNumber}`.slice(0, 255),
+        customer: { name: current.customer?.name || '', contact: current.customer?.phone || '', email: current.customer?.email || '' },
+        notify: { sms: false, email: false },
+        reminder_enable: false,
+        notes: { inventory_order_id: String(current._id || current.id), invoice_number: String(current.invoiceNumber || '') },
+      }),
+    });
+    const link = await razorpayResponse.json().catch(() => ({}));
+    if (!razorpayResponse.ok) return response.status(502).json({ error: link.error?.description || 'Razorpay could not create the payment link.' });
+    const paymentLink = { id: link.id, url: link.short_url, status: link.status || 'created', amountPaise, createdAt: new Date() };
+    if (dataSource === 'mongodb') {
+      order.paymentLink = paymentLink;
+      order.paymentMethod = 'razorpay';
+      await order.save();
+    } else {
+      order.paymentLink = paymentLink;
+      order.paymentMethod = 'razorpay';
+      order.updatedAt = new Date().toISOString();
+    }
+    return response.status(201).json({ order: normalizeOrder(order), paymentLink });
+  } catch (error) { return next(error); }
+});
+
+app.get('/api/payment-links', requireAuth, requireManager, async (_request, response, next) => {
+  try {
+    const items = dataSource === 'mongodb'
+      ? await PaymentLink.find().sort({ createdAt: -1 }).limit(200).lean()
+      : [...demoPaymentLinks].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 200);
+    return response.json({ items: items.map((item) => ({ ...item, id: String(item._id || item.id), _id: undefined })) });
+  } catch (error) { return next(error); }
+});
+
+app.post('/api/payment-links', requireAuth, requireManager, async (request, response, next) => {
+  try {
+    const { razorpay: { keyId, keySecret } } = await getIntegrationConfig();
+    if (!keyId || !keySecret) return response.status(503).json({ error: 'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to the server .env file, then restart the server.' });
+    const amount = Number(request.body?.amount);
+    const amountPaise = Math.round(amount * 100);
+    if (!Number.isFinite(amount) || amount <= 0 || amountPaise < 1) return response.status(400).json({ error: 'Enter a payment amount greater than ₹0.' });
+    const description = String(request.body?.description || '').trim().slice(0, 255);
+    if (!description) return response.status(400).json({ error: 'Enter a description for this payment link.' });
+    const customer = { name: String(request.body?.customer?.name || '').trim().slice(0, 100), email: String(request.body?.customer?.email || '').trim().slice(0, 150), phone: String(request.body?.customer?.phone || '').trim().slice(0, 40) };
+    const referenceId = String(request.body?.referenceId || createOrderNumber('PL')).trim();
+    if (!referenceId || referenceId.length > 40 || !/^[a-zA-Z0-9_-]+$/.test(referenceId)) return response.status(400).json({ error: 'Reference ID can contain letters, numbers, dashes, and underscores (up to 40 characters).' });
+    const referenceExists = dataSource === 'mongodb'
+      ? await PaymentLink.exists({ referenceId })
+      : demoPaymentLinks.some((item) => item.referenceId === referenceId);
+    if (referenceExists) return response.status(409).json({ error: 'That reference ID is already in use. Enter a different one.' });
+    let expireBy;
+    if (request.body?.expiresAt) {
+      expireBy = new Date(request.body.expiresAt);
+      const now = Date.now();
+      const maxExpiry = new Date(now); maxExpiry.setMonth(maxExpiry.getMonth() + 6);
+      if (!Number.isFinite(expireBy.getTime()) || expireBy.getTime() <= now || expireBy.getTime() > maxExpiry.getTime()) return response.status(400).json({ error: 'Expiry must be a future date within six months.' });
+    }
+    const payload = {
+      amount: amountPaise, currency: 'INR', accept_partial: false, reference_id: referenceId,
+      description, ...(Object.values(customer).some(Boolean) ? { customer } : {}), notify: { sms: false, email: false }, reminder_enable: false,
+      ...(expireBy ? { expire_by: Math.floor(expireBy.getTime() / 1000) } : {}),
+      notes: { created_from: 'saraswati_inventory', created_by: String(request.user.id).slice(0, 100) },
+    };
+    const razorpayResponse = await fetch('https://api.razorpay.com/v1/payment_links', {
+      method: 'POST',
+      headers: { Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString('base64')}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload), signal: AbortSignal.timeout(20_000),
+    });
+    const result = await razorpayResponse.json().catch(() => ({}));
+    if (!razorpayResponse.ok) return response.status(502).json({ error: result.error?.description || 'Razorpay could not create the payment link.' });
+    const record = {
+      razorpayId: result.id, url: result.short_url, referenceId, description, amountPaise,
+      amountPaidPaise: Number(result.amount_paid || 0), status: result.status || 'created', customer,
+      expiresAt: expireBy || null, createdById: request.user.id, createdByName: request.user.name,
+    };
+    const saved = dataSource === 'mongodb'
+      ? await PaymentLink.create(record)
+      : { ...record, id: `pl-${Date.now()}`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    if (dataSource !== 'mongodb') demoPaymentLinks.unshift(saved);
+    const savedValue = typeof saved.toObject === 'function' ? saved.toObject() : saved;
+    return response.status(201).json({ paymentLink: { ...savedValue, id: String(saved._id || saved.id), _id: undefined } });
+  } catch (error) { return next(error); }
+});
+
+app.post('/api/webhooks/razorpay', async (request, response) => {
+  let webhookSecret;
+  try { webhookSecret = (await getIntegrationConfig()).razorpay.webhookSecret; }
+  catch { return response.status(503).json({ error: 'Razorpay webhook secret is not available.' }); }
+  const signature = request.get('x-razorpay-signature') || '';
+  if (!webhookSecret || !signature || !request.rawBody) return response.status(400).json({ error: 'Invalid webhook configuration or signature.' });
+  const expected = createHmac('sha256', webhookSecret).update(request.rawBody).digest();
+  let received;
+  try { received = Buffer.from(signature, 'hex'); } catch { return response.status(400).json({ error: 'Invalid webhook signature.' }); }
+  if (received.length !== expected.length || !timingSafeEqual(received, expected)) return response.status(401).json({ error: 'Invalid webhook signature.' });
+  try {
+    const event = request.body?.event;
+    const link = request.body?.payload?.payment_link?.entity;
+    if (!link?.id) return response.json({ received: true, ignored: true });
+    const payableEvents = ['payment_link.paid', 'payment_link.partially_paid'];
+    if (dataSource === 'mongodb') {
+      const order = await Order.findOne({ 'paymentLink.id': link.id });
+      if (order) {
+        order.paymentLink.status = String(link.status || (event === 'payment_link.paid' ? 'paid' : 'partially_paid'));
+        if (payableEvents.includes(event)) {
+          order.amountPaid = Math.min(Number(order.total || 0), Number(link.amount_paid || 0) / 100);
+          order.balanceDue = Math.max(0, Number(order.total || 0) - order.amountPaid);
+          order.paymentStatus = order.balanceDue === 0 ? 'paid' : order.amountPaid > 0 ? 'partial' : 'unpaid';
+        }
+        await order.save();
+      } else {
+        const customLink = await PaymentLink.findOne({ razorpayId: link.id });
+        if (!customLink) return response.json({ received: true, unmatched: true });
+        customLink.status = String(link.status || (event === 'payment_link.paid' ? 'paid' : 'partially_paid'));
+        if (payableEvents.includes(event)) customLink.amountPaidPaise = Number(link.amount_paid || 0);
+        await customLink.save();
+      }
+    } else {
+      const order = demoOrders.find((item) => item.paymentLink?.id === link.id);
+      if (order) {
+        order.paymentLink.status = String(link.status || (event === 'payment_link.paid' ? 'paid' : 'partially_paid'));
+        if (payableEvents.includes(event)) {
+          order.amountPaid = Math.min(Number(order.total || 0), Number(link.amount_paid || 0) / 100);
+          order.balanceDue = Math.max(0, Number(order.total || 0) - order.amountPaid);
+          order.paymentStatus = order.balanceDue === 0 ? 'paid' : order.amountPaid > 0 ? 'partial' : 'unpaid';
+        }
+        order.updatedAt = new Date().toISOString();
+      } else {
+        const customLink = demoPaymentLinks.find((item) => item.razorpayId === link.id);
+        if (!customLink) return response.json({ received: true, unmatched: true });
+        customLink.status = String(link.status || (event === 'payment_link.paid' ? 'paid' : 'partially_paid'));
+        if (payableEvents.includes(event)) customLink.amountPaidPaise = Number(link.amount_paid || 0);
+        customLink.updatedAt = new Date().toISOString();
+      }
+    }
+    return response.json({ received: true });
+  } catch (error) {
+    console.error('Razorpay webhook processing failed:', error.message);
+    return response.status(500).json({ error: 'Webhook processing failed.' });
+  }
+});
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 15,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  keyGenerator: (request) => `login:${ipKeyGenerator(request.ip)}:${createHash('sha256').update(String(request.body?.email || '').trim().toLowerCase()).digest('hex')}`,
+  message: { error: 'Too many sign-in attempts. Try again later.' },
+});
 app.post('/api/auth/login', loginLimiter, async (request, response, next) => {
   try {
     const email = String(request.body.email || '').trim().toLowerCase(); const password = String(request.body.password || '');
@@ -722,31 +1039,40 @@ app.get('/api/products', requireAuth, requireManager, async (_request, response,
   try {
     const page = Math.max(1, Math.floor(Number(_request.query.page) || 1));
     const limit = Math.min(25, Math.max(1, Math.floor(Number(_request.query.limit) || 25)));
-    if (dataSource !== 'mongodb') {
-      const items = demoProductStore.filter((product) => product.active !== false).sort((a, b) => a.sku.localeCompare(b.sku)).slice((page - 1) * limit, page * limit);
-      return response.json({ items, total: demoProductStore.filter((product) => product.active !== false).length, page, pageSize: limit });
-    }
-    const criteria = { active: { $ne: false } };
-    const [items, total] = await Promise.all([
-      Product.find(criteria).sort({ sku: 1 }).skip((page - 1) * limit).limit(limit).lean(),
-      Product.countDocuments(criteria),
-    ]);
-    return response.json({ items: items.map(normalizeProduct), total, page, pageSize: limit });
+    const version = await getProductCacheVersion();
+    const key = `stockroom:catalog:v1:${version}:page:${page}:limit:${limit}`;
+    const result = await cachedJson(key, productQueryCacheSeconds, async () => {
+      if (dataSource !== 'mongodb') {
+        const active = demoProductStore.filter((product) => product.active !== false);
+        const items = active.toSorted((a, b) => a.sku.localeCompare(b.sku)).slice((page - 1) * limit, page * limit);
+        return { items, total: active.length, page, pageSize: limit };
+      }
+      const criteria = { active: { $ne: false } };
+      const [items, total] = await Promise.all([
+        Product.find(criteria).select('-__v').sort({ sku: 1 }).skip((page - 1) * limit).limit(limit).lean(),
+        Product.countDocuments(criteria),
+      ]);
+      return { items: items.map(normalizeProduct), total, page, pageSize: limit };
+    });
+    response.set('Cache-Control', 'private, no-store');
+    return response.json(result.value);
   }
   catch (error) { next(error); }
 });
 
 app.get('/api/products/summary', requireAuth, requireManager, async (_request, response, next) => {
   try {
-    if (dataSource !== 'mongodb') {
-      const products = demoProductStore.filter((product) => product.active !== false);
-      const available = (product, warehouse) => (product.locations || []).filter((location) => !warehouse || location.warehouse === warehouse).reduce((sum, location) => sum + Math.max(0, Number(location.qty || 0) - Number(location.reserved || 0)), 0);
-      return response.json({ totalSkus: products.length, totalUnits: products.reduce((sum, product) => sum + available(product), 0), lowStock: products.filter((product) => available(product) <= Number(product.reorderPoint || 5)).length, warehouses: Object.fromEntries(['KG', 'SPB', 'BG', 'PB'].map((code) => [code, products.reduce((sum, product) => sum + available(product, code), 0)])) });
-    }
-    const [summary] = await Product.aggregate([
+    const version = await getProductCacheVersion();
+    const result = await cachedJson(`stockroom:catalog-summary:v1:${version}`, 30, async () => {
+      if (dataSource !== 'mongodb') {
+        const products = demoProductStore.filter((product) => product.active !== false);
+        const available = (product, warehouse) => (product.locations || []).filter((location) => !warehouse || location.warehouse === warehouse).reduce((sum, location) => sum + Number(location.qty || 0) - Number(location.reserved || 0), 0);
+        return { totalSkus: products.length, totalUnits: products.reduce((sum, product) => sum + available(product), 0), lowStock: products.filter((product) => available(product) <= Number(product.reorderPoint || 5)).length, warehouses: Object.fromEntries(['KG', 'SPB', 'BG', 'PB'].map((code) => [code, products.reduce((sum, product) => sum + available(product, code), 0)])) };
+      }
+      const [summary] = await Product.aggregate([
       { $match: { active: { $ne: false } } },
       { $unwind: { path: '$locations', preserveNullAndEmptyArrays: true } },
-      { $set: { locationAvailable: { $let: { vars: { balance: { $subtract: [{ $ifNull: ['$locations.qty', 0] }, { $ifNull: ['$locations.reserved', 0] }] } }, in: { $cond: [{ $gt: ['$$balance', 0] }, '$$balance', 0] } } } } },
+      { $set: { locationAvailable: { $subtract: [{ $ifNull: ['$locations.qty', 0] }, { $ifNull: ['$locations.reserved', 0] }] } } },
       { $group: {
         _id: '$_id', reorderPoint: { $first: { $ifNull: ['$reorderPoint', 5] } },
         available: { $sum: '$locationAvailable' },
@@ -761,17 +1087,20 @@ app.get('/api/products/summary', requireAuth, requireManager, async (_request, r
         kgUnits: { $sum: '$KG' }, spbUnits: { $sum: '$SPB' }, bgUnits: { $sum: '$BG' }, pbUnits: { $sum: '$PB' },
       } },
       { $project: { _id: 0, totalSkus: 1, totalUnits: 1, lowStock: 1, warehouses: { KG: '$kgUnits', SPB: '$spbUnits', BG: '$bgUnits', PB: '$pbUnits' } } },
-    ]);
-    return response.json(summary || { totalSkus: 0, totalUnits: 0, lowStock: 0, warehouses: { KG: 0, SPB: 0, BG: 0, PB: 0 } });
+      ]);
+      return summary || { totalSkus: 0, totalUnits: 0, lowStock: 0, warehouses: { KG: 0, SPB: 0, BG: 0, PB: 0 } };
+    });
+    return response.json(result.value);
   } catch (error) { return next(error); }
 });
 
 app.get('/api/racks', requireAuth, requireManager, async (_request, response, next) => {
   try {
-    const items = dataSource === 'mongodb'
-      ? await Rack.find().sort({ warehouse: 1, rack: 1 }).lean()
-      : demoRackStore;
-    return response.json({ items: items.map((item) => ({ warehouse: item.warehouse, rack: item.rack })) });
+    const result = await cachedJson('stockroom:racks:v1', 300, async () => {
+      const items = dataSource === 'mongodb' ? await Rack.find().sort({ warehouse: 1, rack: 1 }).lean() : demoRackStore;
+      return { items: items.map((item) => ({ warehouse: item.warehouse, rack: item.rack })) };
+    });
+    return response.json(result.value);
   } catch (error) { return next(error); }
 });
 
@@ -785,6 +1114,7 @@ app.post('/api/racks', requireAuth, requireManager, async (request, response, ne
       if (demoRackStore.some((item) => item.warehouse === warehouse && item.rack === rack)) return response.status(409).json({ error: 'That rack already exists in this warehouse.' });
       demoRackStore.push({ warehouse, rack });
     }
+    if (redisClient?.isReady) await redisClient.del('stockroom:racks:v1').catch(() => {});
     return response.status(201).json({ warehouse, rack });
   } catch (error) { return next(error); }
 });
@@ -796,39 +1126,59 @@ app.get('/api/products/search', requireAuth, requireManager, async (request, res
     if (!['ALL', 'KG', 'SPB', 'BG', 'PB'].includes(warehouse)) return response.status(400).json({ error: 'Unknown warehouse.' });
     if (query.length < 2) return response.json({ items: [], total: 0, query, warehouse: warehouse.toLowerCase(), source: dataSource });
     const page = Math.max(1, Math.floor(Number(request.query.page) || 1)); const pageSize = 25;
-    const cacheDigest = createHash('sha256').update(`${dataSource}|${warehouse}|${query.toLocaleLowerCase()}|${page}`).digest('hex');
-    const cacheKey = `stockroom:search:v2:${cacheDigest}`; const cached = await readSearchCache(cacheKey);
-    if (cached) return response.json({ ...cached, cached: true });
-    let items; let total;
-    if (dataSource === 'mongodb') {
-      const expression = new RegExp(escapeRegex(query), 'i');
-      const criteria = { $or: [{ sku: expression }, { barcode: expression }, { brand: expression }, { name: expression }, { oe: expression }, { category: expression }, { 'vehicleFitment.make': expression }, { 'vehicleFitment.model': expression }] };
-      if (warehouse !== 'ALL') criteria.locations = { $elemMatch: { warehouse } };
-      const exactProduct = await Product.findOne({ active: { $ne: false }, $or: [{ sku: query.toUpperCase() }, { barcode: query }] }).lean();
-      if (exactProduct && (warehouse === 'ALL' || exactProduct.locations.some((location) => location.warehouse === warehouse))) {
-        const exactOe = exactProduct.oe || [];
-        const linkedCriteria = exactOe.length ? { active: { $ne: false }, oe: { $in: exactOe } } : { _id: exactProduct._id };
-        if (warehouse !== 'ALL') linkedCriteria.locations = { $elemMatch: { warehouse } };
-        const linked = await Product.find(linkedCriteria).sort({ sku: 1 }).lean();
-        const linkedProducts = linked.map(normalizeProduct);
-        if (!linkedProducts.some((product) => product.id === String(exactProduct._id))) linkedProducts.push(normalizeProduct(exactProduct));
-        linkedProducts.sort((left, right) => left.sku.localeCompare(right.sku));
-        total = linkedProducts.length;
-        items = linkedProducts.slice((page - 1) * pageSize, page * pageSize);
+    const normalizedQuery = normalizeSearchValue(query);
+    const version = await getProductCacheVersion();
+    const cacheDigest = createHash('sha256').update(`${dataSource}|${warehouse}|${normalizedQuery || query.toLocaleLowerCase()}|${page}`).digest('hex');
+    const cacheKey = `stockroom:search:v3:${version}:${cacheDigest}`;
+    const result = await cachedJson(cacheKey, cacheTtlSeconds, async () => {
+      let items; let total;
+      if (dataSource === 'mongodb') {
+        const expression = new RegExp(escapeRegex(query), 'i');
+        const flexibleExpression = flexibleSearchRegex(query);
+        const searchExpressions = flexibleExpression ? [expression, flexibleExpression] : [expression];
+        const fields = ['sku', 'barcode', 'brand', 'name', 'oe', 'category', 'vehicleFitment.make', 'vehicleFitment.model'];
+        const criteria = { $or: fields.flatMap((field) => searchExpressions.map((pattern) => ({ [field]: pattern }))) };
+        if (warehouse !== 'ALL') criteria.locations = { $elemMatch: { warehouse } };
+        const exactIdentifier = flexibleSearchRegex(query, true);
+        const directIdentifier = query.toUpperCase();
+        const directProduct = await Product.findOne({ active: { $ne: false }, $or: [{ sku: directIdentifier }, { barcode: query }] }).lean();
+        const exactProduct = directProduct || (exactIdentifier
+          ? await Product.findOne({ active: { $ne: false }, $or: [{ sku: exactIdentifier }, { barcode: exactIdentifier }, { oe: exactIdentifier }] }).lean()
+          : null);
+        if (exactProduct && (warehouse === 'ALL' || exactProduct.locations.some((location) => location.warehouse === warehouse))) {
+          const exactOe = exactProduct.oe || [];
+          const linkedCriteria = exactOe.length ? {
+            active: { $ne: false },
+            $or: [
+              { oe: { $in: exactOe } },
+              { oe: { $in: exactOe.map((oe) => flexibleSearchRegex(oe, true)).filter(Boolean) } },
+            ],
+          } : { _id: exactProduct._id };
+          if (warehouse !== 'ALL') linkedCriteria.locations = { $elemMatch: { warehouse } };
+          const linked = await Product.find(linkedCriteria).sort({ sku: 1 }).lean();
+          const linkedProducts = linked.map(normalizeProduct);
+          if (!linkedProducts.some((product) => product.id === String(exactProduct._id))) linkedProducts.push(normalizeProduct(exactProduct));
+          linkedProducts.sort((left, right) => left.sku.localeCompare(right.sku));
+          total = linkedProducts.length;
+          items = linkedProducts.slice((page - 1) * pageSize, page * pageSize);
+        } else {
+          const [found, count] = await Promise.all([Product.find(criteria).select('-__v').sort({ sku: 1 }).skip((page - 1) * pageSize).limit(pageSize).lean(), Product.countDocuments(criteria)]);
+          items = found.map(normalizeProduct); total = count;
+        }
       } else {
-        const [found, count] = await Promise.all([Product.find(criteria).select('-__v').sort({ sku: 1 }).skip((page - 1) * pageSize).limit(pageSize).lean(), Product.countDocuments(criteria)]);
-        items = found.map(normalizeProduct); total = count;
+        const normalized = normalizeSearchValue(query);
+        const matched = demoProductStore.filter((product) => {
+          const fields = [product.name, product.sku, product.brand, product.barcode, product.category, ...(product.oe || []), ...(product.vehicleFitment || []).flatMap((fitment) => [fitment.make, fitment.model, fitment.engine])];
+          const fieldMatch = normalized
+            ? fields.some((value) => normalizeSearchValue(value).includes(normalized))
+            : fields.some((value) => String(value || '').toLocaleLowerCase().includes(query.toLocaleLowerCase()));
+          return fieldMatch && (warehouse === 'ALL' || product.locations.some((location) => location.warehouse === warehouse));
+        });
+        total = matched.length; items = matched.slice((page - 1) * pageSize, page * pageSize);
       }
-    } else {
-      const normalized = query.toLowerCase();
-      const matched = demoProductStore.filter((product) => {
-        const fields = [product.name, product.sku, product.brand, product.barcode, product.category, ...(product.oe || []), ...(product.vehicleFitment || []).flatMap((fitment) => [fitment.make, fitment.model, fitment.engine])];
-        return fields.some((value) => String(value || '').toLowerCase().includes(normalized)) && (warehouse === 'ALL' || product.locations.some((location) => location.warehouse === warehouse));
-      });
-      total = matched.length; items = matched.slice((page - 1) * pageSize, page * pageSize);
-    }
-    const result = { items, total, page, pageSize, query, warehouse: warehouse.toLowerCase(), source: dataSource, cached: false };
-    await writeSearchCache(cacheKey, result); return response.json(result);
+      return { items, total, page, pageSize, query, warehouse: warehouse.toLowerCase(), source: dataSource };
+    });
+    return response.json({ ...result.value, cached: result.cached });
   } catch (error) { return next(error); }
 });
 
@@ -836,30 +1186,35 @@ app.get('/api/products/oe-mappings', requireAuth, requireManager, async (request
   try {
     const page = Math.max(1, Math.floor(Number(request.query.page) || 1));
     const pageSize = Math.min(50, Math.max(1, Math.floor(Number(request.query.limit) || 30)));
-    if (dataSource !== 'mongodb') {
-      const mapping = new Map();
-      for (const product of demoProductStore.filter((item) => item.active !== false)) for (const oe of new Set(product.oe || [])) {
-        if (!oe) continue;
-        if (!mapping.has(oe)) mapping.set(oe, []);
-        mapping.get(oe).push(product);
+    const version = await getProductCacheVersion();
+    const key = `stockroom:oe-mappings:v1:${version}:page:${page}:limit:${pageSize}`;
+    const result = await cachedJson(key, productQueryCacheSeconds, async () => {
+      if (dataSource !== 'mongodb') {
+        const mapping = new Map();
+        for (const product of demoProductStore.filter((item) => item.active !== false)) for (const oe of new Set(product.oe || [])) {
+          if (!oe) continue;
+          if (!mapping.has(oe)) mapping.set(oe, []);
+          mapping.get(oe).push(product);
+        }
+        const entries = [...mapping.entries()].sort(([left], [right]) => left.localeCompare(right));
+        const groups = entries.slice((page - 1) * pageSize, page * pageSize).map(([oe, products]) => ({ oe, products }));
+        return { groups, total: entries.length, page, pageSize };
       }
-      const entries = [...mapping.entries()].sort(([left], [right]) => left.localeCompare(right));
-      const groups = entries.slice((page - 1) * pageSize, page * pageSize).map(([oe, products]) => ({ oe, products }));
-      return response.json({ groups, total: entries.length, page, pageSize });
-    }
-    const [result] = await Product.aggregate([
-      { $match: { active: { $ne: false }, oe: { $exists: true, $ne: [] } } },
-      { $unwind: '$oe' },
-      { $match: { oe: { $type: 'string', $ne: '' } } },
-      { $group: { _id: '$oe' } },
-      { $sort: { _id: 1 } },
-      { $facet: { groups: [{ $skip: (page - 1) * pageSize }, { $limit: pageSize }], count: [{ $count: 'total' }] } },
-    ]);
-    const oeNumbers = (result?.groups || []).map((group) => group._id);
-    const matchingProducts = oeNumbers.length ? (await Product.find({ active: { $ne: false }, oe: { $in: oeNumbers } }).lean()).map(normalizeProduct) : [];
-    const groups = oeNumbers.map((oe) => ({ oe, products: matchingProducts.filter((product) => product.oe.includes(oe)) }));
-    const total = result?.count?.[0]?.total || 0;
-    return response.json({ groups, total, page, pageSize });
+      const [aggregateResult] = await Product.aggregate([
+        { $match: { active: { $ne: false }, oe: { $exists: true, $ne: [] } } },
+        { $unwind: '$oe' },
+        { $match: { oe: { $type: 'string', $ne: '' } } },
+        { $group: { _id: '$oe' } },
+        { $sort: { _id: 1 } },
+        { $facet: { groups: [{ $skip: (page - 1) * pageSize }, { $limit: pageSize }], count: [{ $count: 'total' }] } },
+      ]);
+      const oeNumbers = (aggregateResult?.groups || []).map((group) => group._id);
+      const matchingProducts = oeNumbers.length ? (await Product.find({ active: { $ne: false }, oe: { $in: oeNumbers } }).lean()).map(normalizeProduct) : [];
+      const groups = oeNumbers.map((oe) => ({ oe, products: matchingProducts.filter((product) => product.oe.includes(oe)) }));
+      const total = aggregateResult?.count?.[0]?.total || 0;
+      return { groups, total, page, pageSize };
+    });
+    return response.json(result.value);
   } catch (error) { return next(error); }
 });
 
@@ -890,11 +1245,13 @@ app.delete('/api/products/:id', requireAuth, requireManager, async (request, res
       const product = await Product.findById(request.params.id).select('locations').lean();
       if (!product) return response.status(404).json({ error: 'Product not found.' });
       if ((product.locations || []).some((location) => Number(location.reserved || 0) > 0)) return response.status(409).json({ error: 'This product has units reserved for open orders. Complete or cancel those orders before deleting it.' });
+      if (await Order.exists({ 'items.productId': product._id, status: { $in: ['ready_to_pack', 'accepted', 'packing'] } })) return response.status(409).json({ error: 'This product is part of an open order. Complete or cancel that order before deleting it.' });
       deleted = await Product.findByIdAndDelete(request.params.id);
     } else {
       const index = demoProductStore.findIndex((product) => product.id === request.params.id || product.sku === request.params.id);
       if (index < 0) return response.status(404).json({ error: 'Product not found.' });
       if (demoProductStore[index].locations.some((location) => Number(location.reserved || 0) > 0)) return response.status(409).json({ error: 'This product has units reserved for open orders. Complete or cancel those orders before deleting it.' });
+      if (demoOrders.some((order) => ['ready_to_pack', 'accepted', 'packing'].includes(order.status) && order.items.some((item) => item.sku === demoProductStore[index].sku))) return response.status(409).json({ error: 'This product is part of an open order. Complete or cancel that order before deleting it.' });
       [deleted] = demoProductStore.splice(index, 1);
     }
     await invalidateSearchCache();
@@ -916,7 +1273,7 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
       try {
         const product = validateProduct(rows[index]);
         if (!product.locations.length) throw Object.assign(new Error('This SKU has no valid stock quantity row. Fix the qty column before importing.'), { status: 400 });
-        const warehouseLocations = product.locations.map((location) => ({ ...location, warehouse }));
+        const warehouseLocations = product.locations.filter((location) => location.rack !== 'BACKORDER').map((location) => ({ ...location, warehouse }));
         const byRack = new Map();
         for (const location of warehouseLocations) {
           const key = location.rack;
@@ -938,7 +1295,7 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
         operations.push({ insertOne: { document: { ...product, locations: selectedLocations } } });
         continue;
       }
-      const retained = (existing.locations || []).filter((location) => location.warehouse !== warehouse);
+      const retained = (existing.locations || []).filter((location) => location.warehouse !== warehouse || location.rack === 'BACKORDER');
       const oldSelected = (existing.locations || []).filter((location) => location.warehouse === warehouse);
       let problem = '';
       for (const oldLocation of oldSelected) {
@@ -1132,7 +1489,7 @@ app.post('/api/orders', requireAuth, requireManager, async (request, response, n
     const lines = Array.isArray(request.body.items) ? request.body.items : [];
     const taxRate = gstRate;
     const shippingAmount = Math.max(0, Number(request.body.shippingAmount || 0));
-    const paymentMethod = ['cash', 'card', 'upi', 'bank_transfer', 'credit'].includes(request.body.paymentMethod) ? request.body.paymentMethod : 'cash';
+    const paymentMethod = ['cash', 'card', 'upi', 'bank_transfer', 'credit', 'razorpay'].includes(request.body.paymentMethod) ? request.body.paymentMethod : 'cash';
     const requestedPacker = String(request.body.packerId || '').trim();
     let packer = null;
     if (!requestedPacker) return response.status(400).json({ error: 'Assign this order to an approved packer at the selected warehouse.' });
@@ -1144,6 +1501,7 @@ app.post('/api/orders', requireAuth, requireManager, async (request, response, n
       packer = cleanUser(found);
     }
     if (!['KG', 'SPB', 'BG', 'PB'].includes(warehouse) || !customer.name || !lines.length) return response.status(400).json({ error: 'Customer, warehouse, and at least one item are required.' });
+    const { allowZeroStockSales } = await loadSystemSettings();
     const orderItems = []; const seen = new Set();
     for (const line of lines) {
       const product = await findProductBySku(line.sku);
@@ -1152,7 +1510,7 @@ app.post('/api/orders', requireAuth, requireManager, async (request, response, n
       if (seen.has(product.sku)) return response.status(400).json({ error: `Remove duplicate line ${product.sku} and update its quantity.` });
       seen.add(product.sku);
       const available = product.locations.filter((location) => location.warehouse === warehouse).reduce((sum, location) => sum + Number(location.qty || 0) - Number(location.reserved || 0), 0);
-      if (quantity > available) return response.status(409).json({ error: `${product.sku} has only ${Math.max(0, available)} available at ${warehouse}.` });
+      if (quantity > Math.max(0, available) && !allowZeroStockSales) return response.status(409).json({ error: `${product.sku} has only ${Math.max(0, available)} available at ${warehouse}. Enable zero-stock sales in System settings to create this as a backorder.` });
       const unitPrice = Number(line.unitPrice ?? product.price);
       if (!Number.isFinite(unitPrice) || unitPrice < 0) return response.status(400).json({ error: `Invalid price for ${product.sku}.` });
       const gstIncluded = Boolean(product.priceIncludesGst);
@@ -1162,16 +1520,16 @@ app.post('/api/orders', requireAuth, requireManager, async (request, response, n
     }
     const subtotal = money(orderItems.reduce((sum, item) => sum + item.taxableAmount, 0)); const discountAmount = money(Math.min(subtotal, Math.max(0, Number(request.body.discountAmount || 0))));
     const taxAmount = money((subtotal - discountAmount) * taxRate / 100);
-    const total = money(subtotal - discountAmount + taxAmount + shippingAmount); const amountPaid = Math.min(total, Math.max(0, Number(request.body.amountPaid ?? (paymentMethod === 'credit' ? 0 : total))));
+    const total = money(subtotal - discountAmount + taxAmount + shippingAmount); const amountPaid = Math.min(total, Math.max(0, Number(request.body.amountPaid ?? (['credit', 'razorpay'].includes(paymentMethod) ? 0 : total))));
     const order = { orderNumber: createOrderNumber('SO'), invoiceNumber: createOrderNumber('INV'), source: 'manual', createdById: request.user.id, createdByName: request.user.name, createdByRole: request.user.role, customer, warehouse, items: orderItems, subtotal, discountAmount, shippingAmount, taxRate, taxAmount, total, paymentMethod, amountPaid, paymentStatus: amountPaid >= total ? 'paid' : amountPaid > 0 ? 'partial' : 'unpaid', balanceDue: Math.max(0, total - amountPaid), status: 'ready_to_pack', statusHistory: [{ status: 'ready_to_pack', userId: request.user.id, userName: request.user.name, note: packer ? `Order created for ${packer.name}` : 'Order created and queued for packing' }], notes: String(request.body.notes || '').slice(0, 1000) };
     if (dataSource === 'mongodb') {
-      const saved = await createAssignedOrder(order, packer);
+      const saved = await createAssignedOrder(order, packer, allowZeroStockSales);
       notifyPacker(packer, saved).catch((error) => console.warn('Packing push notification failed:', error.message));
       await invalidateSearchCache();
       return response.status(201).json({ order: saved });
     }
     const saved = { ...order, id: `o-${Date.now()}`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    reserveDemoOrder(saved, packer);
+    reserveDemoOrder(saved, packer, allowZeroStockSales);
     demoOrders.unshift(saved);
     await recordActivityEvent('sale_created', saved, request.user);
     notifyPacker(packer, saved).catch((error) => console.warn('Packing push notification failed:', error.message));
@@ -1184,8 +1542,9 @@ app.post('/api/orders/:id/accept', requireAuth, async (request, response, next) 
   try {
     if (request.user.role !== 'Packer' && !isAdmin(request.user)) return response.status(403).json({ error: 'Packer access required.' });
     let updated;
-    if (dataSource === 'mongodb') updated = await reserveOrder(request.params.id, request.user);
-    else { const order = demoOrders.find((item) => item.id === request.params.id); if (!order) return response.status(404).json({ error: 'Order not found.' }); if (request.user.role === 'Packer' && (order.assignedTo !== request.user.id || order.warehouse !== request.user.warehouse)) return response.status(403).json({ error: 'You can only accept orders assigned to you at your warehouse.' }); if (order.status !== 'ready_to_pack') return response.status(409).json({ error: 'This order is no longer waiting to be accepted.' }); updated = reserveDemoOrder(order, request.user); }
+    const { allowZeroStockSales } = await loadSystemSettings();
+    if (dataSource === 'mongodb') updated = await reserveOrder(request.params.id, request.user, allowZeroStockSales);
+    else { const order = demoOrders.find((item) => item.id === request.params.id); if (!order) return response.status(404).json({ error: 'Order not found.' }); if (request.user.role === 'Packer' && (order.assignedTo !== request.user.id || order.warehouse !== request.user.warehouse)) return response.status(403).json({ error: 'You can only accept orders assigned to you at your warehouse.' }); if (order.status !== 'ready_to_pack') return response.status(409).json({ error: 'This order is no longer waiting to be accepted.' }); updated = reserveDemoOrder(order, request.user, allowZeroStockSales); }
     await invalidateSearchCache(); return response.json({ order: updated });
   } catch (error) { return next(error); }
 });
@@ -1198,7 +1557,7 @@ app.patch('/api/orders/:id/status', requireAuth, async (request, response, next)
       const order = demoOrders.find((item) => item.id === request.params.id); if (!order) return response.status(404).json({ error: 'Order not found.' });
       if (!canManage(request.user) && (order.assignedTo !== request.user.id || order.warehouse !== request.user.warehouse)) return response.status(403).json({ error: 'You can only update orders assigned to you at your warehouse.' });
       const transitions = { accepted: ['packing'], packing: ['packed'], packed: ['shipped'], shipped: ['completed'] };
-      if (target === 'cancelled' && ['ready_to_pack', 'accepted', 'packing'].includes(order.status)) { if (['accepted', 'packing'].includes(order.status)) cancelDemoReservation(order); }
+      if (target === 'cancelled' && ['ready_to_pack', 'accepted', 'packing'].includes(order.status)) cancelDemoReservation(order);
       else if (!(transitions[order.status] || []).includes(target)) return response.status(409).json({ error: `Cannot move an order from ${order.status} to ${target}.` });
       if (target === 'packed') consumeDemoStock(order);
       order.status = target; order.updatedAt = new Date().toISOString(); if (target === 'packed') order.packedBy = request.user.name;
@@ -1336,12 +1695,16 @@ app.get('/api/reports/sales', requireAuth, requireManager, async (request, respo
   } catch (error) { return next(error); }
 });
 
-app.get('/api/integrations/woocommerce/status', requireAuth, requireManager, (_request, response) => response.json({ configured: Boolean(process.env.WOOCOMMERCE_URL && process.env.WOOCOMMERCE_CONSUMER_KEY && process.env.WOOCOMMERCE_CONSUMER_SECRET), storeUrl: process.env.WOOCOMMERCE_URL || '', defaultWarehouse: ['KG', 'SPB', 'BG', 'PB'].includes(process.env.WOOCOMMERCE_DEFAULT_WAREHOUSE) ? process.env.WOOCOMMERCE_DEFAULT_WAREHOUSE : 'KG' }));
+app.get('/api/integrations/woocommerce/status', requireAuth, requireManager, async (_request, response, next) => {
+  try { return response.json(publicIntegrationSettings(await getIntegrationConfig()).wooCommerce); }
+  catch (error) { return next(error); }
+});
 
 app.post('/api/integrations/woocommerce/test', requireAuth, requireManager, async (_request, response, next) => {
   try {
     const products = await wooRequest('products?per_page=1&status=any');
-    return response.json({ connected: true, storeUrl: process.env.WOOCOMMERCE_URL || '', message: `Connected to WooCommerce. Product access verified${products.length ? '.' : '; the store has no products yet.'}` });
+    const { wooCommerce } = await getIntegrationConfig();
+    return response.json({ connected: true, storeUrl: wooCommerce.url, message: `Connected to WooCommerce. Product access verified${products.length ? '.' : '; the store has no products yet.'}` });
   } catch (error) { return next(error); }
 });
 
@@ -1383,14 +1746,14 @@ app.get('/api/integrations/woocommerce/fitments/products', requireAuth, requireM
 
 app.post('/api/integrations/woocommerce/products/pull', requireAuth, requireAdmin, async (_request, response, next) => {
   try {
-    let page = 1; let imported = 0; const defaultWarehouse = process.env.WOOCOMMERCE_DEFAULT_WAREHOUSE || 'KG';
+    let page = 1; let imported = 0; const { wooCommerce } = await getIntegrationConfig(); const defaultWarehouse = wooCommerce.defaultWarehouse;
     if (!['KG', 'SPB', 'BG', 'PB'].includes(defaultWarehouse)) throw Object.assign(new Error('Invalid WOOCOMMERCE_DEFAULT_WAREHOUSE.'), { status: 500 });
     while (page <= 100) {
       const remote = await wooRequest(`products?per_page=100&page=${page}&status=publish`);
       if (!remote.length) break;
       for (const item of remote) {
         if (!item.sku) continue;
-        const data = validateProduct({ sku: item.sku, name: item.name, brand: wcMeta(item, 'brand') || item.brands?.[0]?.name || 'Unbranded', category: item.categories?.[0]?.name || 'General', oe: String(wcMeta(item, 'oe_number') || '').split(/[|,;]/).filter(Boolean), price: Number(item.sale_price || item.regular_price || 0), barcode: wcMeta(item, 'barcode') || '', vehicleFitment: [], locations: [{ warehouse: defaultWarehouse, rack: process.env.WOOCOMMERCE_DEFAULT_RACK || 'G-1A', qty: 0 }] });
+        const data = validateProduct({ sku: item.sku, name: item.name, brand: wcMeta(item, 'brand') || item.brands?.[0]?.name || 'Unbranded', category: item.categories?.[0]?.name || 'General', oe: String(wcMeta(item, 'oe_number') || '').split(/[|,;]/).filter(Boolean), price: Number(item.sale_price || item.regular_price || 0), barcode: wcMeta(item, 'barcode') || '', vehicleFitment: [], locations: [{ warehouse: defaultWarehouse, rack: wooCommerce.defaultRack, qty: 0 }] });
         const found = await findProductBySku(data.sku);
         if (found) {
           if (dataSource === 'mongodb') { found.wooCommerceId = item.id; found.name = data.name; found.brand = data.brand; found.category = data.category; found.oe = data.oe; found.price = data.price; await found.save(); }
@@ -1407,15 +1770,38 @@ app.post('/api/integrations/woocommerce/products/pull', requireAuth, requireAdmi
 
 app.post('/api/integrations/woocommerce/orders/pull', requireAuth, requireManager, async (request, response, next) => {
   try {
-    const warehouse = String(request.body?.warehouse || process.env.WOOCOMMERCE_DEFAULT_WAREHOUSE || 'KG').toUpperCase();
+    const requestedStatus = String(request.body?.status || 'processing').toLowerCase();
+    if (!['processing', 'cancelled'].includes(requestedStatus)) return response.status(400).json({ error: 'Import either processing or cancelled WooCommerce orders.' });
+    const { wooCommerce } = await getIntegrationConfig();
+    const warehouse = String(request.body?.warehouse || wooCommerce.defaultWarehouse).toUpperCase();
     if (!['KG', 'SPB', 'BG', 'PB'].includes(warehouse)) return response.status(400).json({ error: 'Choose a valid default warehouse in WooCommerce settings.' });
     let page = 1; let imported = 0; let duplicates = 0; const warnings = [];
     while (page <= 100) {
-      const remoteOrders = await wooRequest(`orders?per_page=100&page=${page}&status=processing`);
+      const remoteOrders = await wooRequest(`orders?per_page=100&page=${page}&status=${requestedStatus}`);
       if (!remoteOrders.length) break;
       for (const remote of remoteOrders) {
-        const already = dataSource === 'mongodb' ? await Order.exists({ wooCommerceId: remote.id }) : demoOrders.some((order) => order.wooCommerceId === remote.id);
-        if (already) { duplicates += 1; continue; }
+        const existing = dataSource === 'mongodb'
+          ? await Order.findOne({ wooCommerceId: remote.id })
+          : demoOrders.find((order) => Number(order.wooCommerceId) === Number(remote.id));
+        if (existing) {
+          duplicates += 1;
+          if (existing.wooCommerceStatus !== requestedStatus) {
+            // A cancelled website order must leave the packer's active queue and
+            // release any stock reservation created when it was accepted.
+            if (requestedStatus === 'cancelled' && !['packed', 'shipped', 'completed', 'cancelled'].includes(existing.status)) {
+              if (dataSource === 'mongodb') await updateOrderStatus(existing.id, 'cancelled', request.user);
+              else {
+                if (['accepted', 'packing'].includes(existing.status)) cancelDemoReservation(existing);
+                existing.status = 'cancelled';
+                existing.statusHistory.push({ status: 'cancelled', userId: request.user.id, userName: request.user.name, note: 'WooCommerce order was cancelled', at: new Date() });
+                existing.updatedAt = new Date().toISOString();
+              }
+            }
+            if (dataSource === 'mongodb') await Order.updateOne({ _id: existing._id }, { $set: { wooCommerceStatus: requestedStatus } });
+            else existing.wooCommerceStatus = requestedStatus;
+          }
+          continue;
+        }
         const items = [];
         for (const line of remote.line_items || []) {
           const quantity = Math.max(0, Math.floor(Number(line.quantity || 0)));
@@ -1436,17 +1822,21 @@ app.post('/api/integrations/woocommerce/orders/pull', requireAuth, requireManage
         const taxAmount = (remote.tax_lines || []).reduce((sum, line) => sum + Number(line.tax_total || 0), 0) || items.reduce((sum, item) => sum + item.gstAmount, 0);
         const total = Number(remote.total || (discountedSubtotal + shippingAmount + taxAmount));
         const customerName = `${remote.billing?.first_name || ''} ${remote.billing?.last_name || ''}`.trim() || 'WooCommerce customer';
-        const order = { orderNumber: `WC-${remote.id}`, invoiceNumber: createOrderNumber('INV'), source: 'woocommerce', createdById: request.user.id, createdByName: request.user.name, createdByRole: request.user.role, wooCommerceId: remote.id, customer: { name: customerName, email: remote.billing?.email || '', phone: remote.billing?.phone || '', address: [remote.billing?.address_1, remote.billing?.address_2, remote.billing?.city, remote.billing?.state, remote.billing?.postcode].filter(Boolean).join(', '), gstin: '' }, warehouse, items, subtotal, discountAmount, shippingAmount, taxRate: subtotal ? Number(((taxAmount / subtotal) * 100).toFixed(2)) : 0, taxAmount, total, paymentMethod: 'woocommerce', paymentStatus: 'paid', amountPaid: total, balanceDue: 0, status: 'ready_to_pack', assignedTo: '', assignedName: '', statusHistory: [{ status: 'ready_to_pack', userId: request.user.id, userName: request.user.name, note: 'Received from website; waiting for warehouse and packer assignment' }] };
+        const customerPaymentStatus = requestedStatus === 'cancelled' ? (remote.refunds?.length ? 'refunded' : remote.date_paid ? 'paid' : 'unpaid') : 'paid';
+        const amountPaid = customerPaymentStatus === 'paid' || customerPaymentStatus === 'refunded' ? total : 0;
+        const initialOrderStatus = requestedStatus === 'cancelled' ? 'cancelled' : 'ready_to_pack';
+        const order = { orderNumber: `WC-${remote.id}`, invoiceNumber: createOrderNumber('INV'), source: 'woocommerce', wooCommerceStatus: requestedStatus, createdById: request.user.id, createdByName: request.user.name, createdByRole: request.user.role, wooCommerceId: remote.id, customer: { name: customerName, email: remote.billing?.email || '', phone: remote.billing?.phone || '', address: [remote.billing?.address_1, remote.billing?.address_2, remote.billing?.city, remote.billing?.state, remote.billing?.postcode].filter(Boolean).join(', '), gstin: '' }, warehouse, items, subtotal, discountAmount, shippingAmount, taxRate: subtotal ? Number(((taxAmount / subtotal) * 100).toFixed(2)) : 0, taxAmount, total, paymentMethod: 'woocommerce', paymentStatus: customerPaymentStatus, amountPaid, balanceDue: Math.max(0, total - amountPaid), status: initialOrderStatus, assignedTo: '', assignedName: '', statusHistory: [{ status: initialOrderStatus, userId: request.user.id, userName: request.user.name, note: requestedStatus === 'cancelled' ? 'Imported from WooCommerce cancellation list; contact the customer to confirm' : 'Received from website; waiting for warehouse and packer assignment' }] };
         let created;
         if (dataSource === 'mongodb') [created] = await Order.create([order]);
         else { created = { ...order, id: `woo-order-${remote.id}`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }; demoOrders.unshift(created); }
-        await recordActivityEvent('sale_created', created, request.user);
+        if (requestedStatus === 'processing') await recordActivityEvent('sale_created', created, request.user);
         imported += 1;
       }
       if (remoteOrders.length < 100) break; page += 1;
     }
-    const message = imported ? `Imported ${imported} processing website order${imported === 1 ? '' : 's'} to Website Orders. Assign each order a warehouse and packer there.` : duplicates ? `No new processing website orders. ${duplicates} already imported.` : 'No processing website orders were found.';
-    return response.json({ imported, duplicates, warnings, message });
+    const statusLabel = requestedStatus === 'cancelled' ? 'cancelled' : 'processing';
+    const message = imported ? `Imported ${imported} ${statusLabel} website order${imported === 1 ? '' : 's'} into Website Orders.` : duplicates ? `No new ${statusLabel} website orders. ${duplicates} already imported; their WooCommerce status was refreshed.` : `No ${statusLabel} website orders were found.`;
+    return response.json({ imported, duplicates, warnings, status: requestedStatus, message });
   } catch (error) { return next(error); }
 });
 
@@ -1467,7 +1857,7 @@ let sessionSweepTimer;
 async function start() {
   if (process.env.MONGODB_URI) {
     await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 8000, autoIndex: !production }); dataSource = 'mongodb';
-    await Promise.all([Product.createIndexes(), User.createIndexes(), Order.createIndexes(), Rack.createIndexes(), PackingPhoto.createIndexes(), PushSubscription.createIndexes(), ActivityEvent.createIndexes(), UserSession.createIndexes()]);
+    await Promise.all([Product.createIndexes(), User.createIndexes(), Order.createIndexes(), PaymentLink.createIndexes(), Rack.createIndexes(), SystemSetting.createIndexes(), PackingPhoto.createIndexes(), PushSubscription.createIndexes(), ActivityEvent.createIndexes(), UserSession.createIndexes()]);
     await User.updateMany({ role: 'Sales Person' }, { $set: { role: 'Packer', approved: true, active: true } });
     if (process.env.BOOTSTRAP_ADMIN_EMAIL && process.env.BOOTSTRAP_ADMIN_PASSWORD) {
       const email = process.env.BOOTSTRAP_ADMIN_EMAIL.toLowerCase();

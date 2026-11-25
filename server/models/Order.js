@@ -13,6 +13,7 @@ const orderLineSchema = new mongoose.Schema({
   gstIncluded: { type: Boolean, default: false },
   gstRate: { type: Number, min: 0 },
   gstAmount: { type: Number, min: 0, default: 0 },
+  backorderedQuantity: { type: Number, min: 0, default: 0 },
   allocations: [{ warehouse: String, rack: String, quantity: Number }],
 }, { _id: false });
 
@@ -21,6 +22,7 @@ const orderSchema = new mongoose.Schema({
   invoiceNumber: { type: String, required: true, unique: true, index: true },
   source: { type: String, enum: ['manual', 'woocommerce'], default: 'manual' },
   wooCommerceId: { type: Number, sparse: true, unique: true },
+  wooCommerceStatus: { type: String, enum: ['', 'processing', 'cancelled'], default: '' },
   customer: { name: { type: String, required: true }, email: String, phone: String, address: String, gstin: String },
   warehouse: { type: String, enum: ['KG', 'SPB', 'BG', 'PB'], required: true },
   items: { type: [orderLineSchema], required: true },
@@ -30,7 +32,8 @@ const orderSchema = new mongoose.Schema({
   taxRate: { type: Number, min: 0, max: 100, default: 0 },
   taxAmount: { type: Number, min: 0, default: 0 },
   total: { type: Number, required: true, min: 0 },
-  paymentMethod: { type: String, enum: ['cash', 'card', 'upi', 'bank_transfer', 'credit', 'woocommerce'], default: 'cash' },
+  paymentMethod: { type: String, enum: ['cash', 'card', 'upi', 'bank_transfer', 'credit', 'razorpay', 'woocommerce'], default: 'cash' },
+  paymentLink: { id: { type: String, default: '' }, url: { type: String, default: '' }, status: { type: String, default: '' }, amountPaise: { type: Number, min: 0, default: 0 }, createdAt: Date },
   paymentStatus: { type: String, enum: ['unpaid', 'partial', 'paid', 'refunded'], default: 'unpaid' },
   amountPaid: { type: Number, min: 0, default: 0 },
   balanceDue: { type: Number, min: 0, default: 0 },
