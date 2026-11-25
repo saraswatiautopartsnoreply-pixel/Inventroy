@@ -420,8 +420,10 @@ function App() {
   const refreshCustomPaymentLinks = async () => {
     setPaymentLinksLoading(true);
     try {
+      const sync = await api('/payment-links/refresh', { method: 'POST' });
       const [links, status] = await Promise.all([api('/payment-links'), api('/payments/razorpay/status')]);
       setPaymentLinks(links.items); setRazorpayStatus(status.razorpay);
+      setToast(sync.failed ? `${sync.message} ${sync.failed} could not be checked; verify Razorpay configuration.` : sync.message);
     } catch (failure) { setToast(failure.message); }
     finally { setPaymentLinksLoading(false); }
   };

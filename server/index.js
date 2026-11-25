@@ -756,6 +756,40 @@ app.get('/api/payment-links', requireAuth, requireManager, async (_request, resp
   } catch (error) { return next(error); }
 });
 
+app.post('/api/payment-links/refresh', requireAuth, requireManager, async (_request, response, next) => {
+  try {
+    const { razorpay: { keyId, keySecret } } = getIntegrationConfig();
+    if (!keyId || !keySecret) return response.status(503).json({ error: 'Razorpay is not configured. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to the server .env file, then restart the server.' });
+    const terminalStatuses = ['paid', 'cancelled', 'expired'];
+    const candidates = dataSource === 'mongodb'
+      ? await PaymentLink.find({ status: { $nin: terminalStatuses } }).sort({ createdAt: -1 }).limit(50)
+      : demoPaymentLinks.filter((item) => !terminalStatuses.includes(item.status)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50);
+    let checked = 0; let updated = 0; let failed = 0;
+    for (let index = 0; index < candidates.length; index += 5) {
+      await Promise.all(candidates.slice(index, index + 5).map(async (record) => {
+        try {
+          const providerResponse = await fetch(`https://api.razorpay.com/v1/payment_links/${encodeURIComponent(record.razorpayId)}`, {
+            headers: { Authorization: `Basic ${Buffer.from(`${keyId}:${keySecret}`).toString('base64')}` },
+            signal: AbortSignal.timeout(10_000),
+          });
+          const providerLink = await providerResponse.json().catch(() => ({}));
+          if (!providerResponse.ok) { failed += 1; return; }
+          checked += 1;
+          const nextStatus = String(providerLink.status || record.status);
+          const nextAmountPaid = Number(providerLink.amount_paid || 0);
+          if (nextStatus !== record.status || nextAmountPaid !== Number(record.amountPaidPaise || 0)) updated += 1;
+          record.status = nextStatus;
+          record.amountPaidPaise = nextAmountPaid;
+          if (nextStatus === 'paid') { record.lastFailureAt = null; record.lastFailureReason = ''; }
+          if (dataSource === 'mongodb') await record.save();
+          else record.updatedAt = new Date().toISOString();
+        } catch { failed += 1; }
+      }));
+    }
+    return response.json({ checked, updated, failed, message: `Checked ${checked} pending link${checked === 1 ? '' : 's'} with Razorpay; ${updated} status${updated === 1 ? '' : 'es'} updated.` });
+  } catch (error) { return next(error); }
+});
+
 app.post('/api/payment-links', requireAuth, requireManager, async (request, response, next) => {
   try {
     const { razorpay: { keyId, keySecret } } = await getIntegrationConfig();
