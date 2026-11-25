@@ -819,6 +819,51 @@ app.post('/api/webhooks/razorpay', async (request, response) => {
   try {
     const event = request.body?.event;
     const link = request.body?.payload?.payment_link?.entity;
+    const payment = request.body?.payload?.payment?.entity;
+    if (event === 'payment.failed' && payment) {
+      const paymentLinkId = payment.payment_link_id || payment.invoice_id;
+      if (!paymentLinkId || !payment.id) return response.json({ received: true, ignored: true });
+      const failedAt = Number.isFinite(Number(payment.created_at)) ? new Date(Number(payment.created_at) * 1000) : new Date();
+      const failureReason = String(payment.error_description || payment.error_reason || 'Payment attempt failed').slice(0, 160);
+      if (dataSource === 'mongodb') {
+        const order = await Order.findOne({ 'paymentLink.id': paymentLinkId });
+        if (order) {
+          const ids = order.paymentLink.failedPaymentIds || [];
+          if (!ids.includes(payment.id)) {
+            order.paymentLink.failedPaymentIds = [...ids, payment.id].slice(-20);
+            order.paymentLink.failedAttempts = (order.paymentLink.failedAttempts || 0) + 1;
+            order.paymentLink.lastFailureAt = failedAt;
+            order.paymentLink.lastFailureReason = failureReason;
+            await order.save();
+          }
+        } else {
+          const customLink = await PaymentLink.findOne({ razorpayId: paymentLinkId });
+          if (!customLink) return response.json({ received: true, unmatched: true });
+          if (!(customLink.failedPaymentIds || []).includes(payment.id)) {
+            customLink.failedPaymentIds = [...(customLink.failedPaymentIds || []), payment.id].slice(-20);
+            customLink.failedAttempts = (customLink.failedAttempts || 0) + 1;
+            customLink.lastFailureAt = failedAt;
+            customLink.lastFailureReason = failureReason;
+            await customLink.save();
+          }
+        }
+      } else {
+        const order = demoOrders.find((item) => item.paymentLink?.id === paymentLinkId);
+        const customLink = demoPaymentLinks.find((item) => item.razorpayId === paymentLinkId);
+        const record = order?.paymentLink || customLink;
+        if (!record) return response.json({ received: true, unmatched: true });
+        const ids = record.failedPaymentIds || [];
+        if (!ids.includes(payment.id)) {
+          record.failedPaymentIds = [...ids, payment.id].slice(-20);
+          record.failedAttempts = (record.failedAttempts || 0) + 1;
+          record.lastFailureAt = failedAt.toISOString();
+          record.lastFailureReason = failureReason;
+          if (order) order.updatedAt = new Date().toISOString();
+          else customLink.updatedAt = new Date().toISOString();
+        }
+      }
+      return response.json({ received: true });
+    }
     if (!link?.id) return response.json({ received: true, ignored: true });
     const payableEvents = ['payment_link.paid', 'payment_link.partially_paid'];
     if (dataSource === 'mongodb') {
@@ -829,6 +874,7 @@ app.post('/api/webhooks/razorpay', async (request, response) => {
           order.amountPaid = Math.min(Number(order.total || 0), Number(link.amount_paid || 0) / 100);
           order.balanceDue = Math.max(0, Number(order.total || 0) - order.amountPaid);
           order.paymentStatus = order.balanceDue === 0 ? 'paid' : order.amountPaid > 0 ? 'partial' : 'unpaid';
+          if (event === 'payment_link.paid') { order.paymentLink.lastFailureAt = null; order.paymentLink.lastFailureReason = ''; }
         }
         await order.save();
       } else {
@@ -836,6 +882,7 @@ app.post('/api/webhooks/razorpay', async (request, response) => {
         if (!customLink) return response.json({ received: true, unmatched: true });
         customLink.status = String(link.status || (event === 'payment_link.paid' ? 'paid' : 'partially_paid'));
         if (payableEvents.includes(event)) customLink.amountPaidPaise = Number(link.amount_paid || 0);
+        if (event === 'payment_link.paid') { customLink.lastFailureAt = null; customLink.lastFailureReason = ''; }
         await customLink.save();
       }
     } else {
@@ -846,6 +893,7 @@ app.post('/api/webhooks/razorpay', async (request, response) => {
           order.amountPaid = Math.min(Number(order.total || 0), Number(link.amount_paid || 0) / 100);
           order.balanceDue = Math.max(0, Number(order.total || 0) - order.amountPaid);
           order.paymentStatus = order.balanceDue === 0 ? 'paid' : order.amountPaid > 0 ? 'partial' : 'unpaid';
+          if (event === 'payment_link.paid') { order.paymentLink.lastFailureAt = null; order.paymentLink.lastFailureReason = ''; }
         }
         order.updatedAt = new Date().toISOString();
       } else {
@@ -853,6 +901,7 @@ app.post('/api/webhooks/razorpay', async (request, response) => {
         if (!customLink) return response.json({ received: true, unmatched: true });
         customLink.status = String(link.status || (event === 'payment_link.paid' ? 'paid' : 'partially_paid'));
         if (payableEvents.includes(event)) customLink.amountPaidPaise = Number(link.amount_paid || 0);
+        if (event === 'payment_link.paid') { customLink.lastFailureAt = null; customLink.lastFailureReason = ''; }
         customLink.updatedAt = new Date().toISOString();
       }
     }

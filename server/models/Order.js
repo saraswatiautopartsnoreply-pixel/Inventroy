@@ -33,7 +33,7 @@ const orderSchema = new mongoose.Schema({
   taxAmount: { type: Number, min: 0, default: 0 },
   total: { type: Number, required: true, min: 0 },
   paymentMethod: { type: String, enum: ['cash', 'card', 'upi', 'bank_transfer', 'credit', 'razorpay', 'woocommerce'], default: 'cash' },
-  paymentLink: { id: { type: String, default: '' }, url: { type: String, default: '' }, status: { type: String, default: '' }, amountPaise: { type: Number, min: 0, default: 0 }, createdAt: Date },
+  paymentLink: { id: { type: String, default: '' }, url: { type: String, default: '' }, status: { type: String, default: '' }, amountPaise: { type: Number, min: 0, default: 0 }, failedAttempts: { type: Number, min: 0, default: 0 }, failedPaymentIds: { type: [String], default: [] }, lastFailureAt: { type: Date, default: null }, lastFailureReason: { type: String, default: '' }, createdAt: Date },
   paymentStatus: { type: String, enum: ['unpaid', 'partial', 'paid', 'refunded'], default: 'unpaid' },
   amountPaid: { type: Number, min: 0, default: 0 },
   balanceDue: { type: Number, min: 0, default: 0 },
