@@ -13,6 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { demoProducts, demoUsers } from '../src/data.js';
 import { Product } from './models/Product.js';
+import { ProductCounter } from './models/ProductCounter.js';
 import { User } from './models/User.js';
 import { Order } from './models/Order.js';
 import { PaymentLink } from './models/PaymentLink.js';
@@ -37,7 +38,7 @@ const sessionKey = new TextEncoder().encode(sessionSecret);
 const sessionCookie = 'stockroom_session';
 let dataSource = 'demo';
 let redisClient = null;
-let demoProductStore = structuredClone(demoProducts).map((product) => ({ ...product, locations: product.locations.map((location) => ({ ...location, reserved: 0 })) }));
+let demoProductStore = structuredClone(demoProducts).map((product, index) => ({ ...product, productNumber: index + 1, locations: product.locations.map((location) => ({ ...location, reserved: 0 })) }));
 let demoUserStore = structuredClone(demoUsers);
 let demoOrders = [];
 let demoPaymentLinks = [];
@@ -48,6 +49,7 @@ let demoActivityEvents = [];
 let demoUserSessions = [];
 let demoSystemSettings = { allowZeroStockSales: true };
 const cacheFlights = new Map();
+let productSequenceReady;
 const photoRetentionMs = 7 * 24 * 60 * 60 * 1000;
 const auditRetentionDays = 210;
 const auditRetentionMs = auditRetentionDays * 24 * 60 * 60 * 1000;
@@ -170,7 +172,7 @@ function flexibleSearchRegex(value, exact = false) {
 function normalizeProduct(product) {
   const value = typeof product.toObject === 'function' ? product.toObject() : product;
   return {
-    id: String(value._id || value.id), name: value.name || '', sku: value.sku, brand: value.brand,
+    id: String(value._id || value.id), productNumber: Number(value.productNumber || 0) || null, name: value.name || '', sku: value.sku, brand: value.brand,
     category: value.category || 'General', unit: value.unit || 'PCS', vehicleFitment: value.vehicleFitment || [],
     oe: Array.isArray(value.oe) ? value.oe : [], price: Number(value.price || 0), priceIncludesGst: Boolean(value.priceIncludesGst),
     cost: Number(value.cost || 0), reorderPoint: Number(value.reorderPoint || 0), barcode: value.barcode || '',
@@ -181,6 +183,24 @@ function normalizeProduct(product) {
 
 function productLabel(product) {
   return String(product?.name || '').trim() || [product?.brand, product?.sku].filter(Boolean).join(' ') || 'Unnamed product';
+}
+
+async function reserveProductNumbers(count = 1) {
+  if (!Number.isInteger(count) || count < 1) return [];
+  if (!productSequenceReady) {
+    productSequenceReady = (async () => {
+      const highest = await Product.findOne({ productNumber: { $type: 'number' } }).sort({ productNumber: -1 }).select('productNumber').lean();
+      await ProductCounter.updateOne({ _id: 'products' }, { $max: { value: Number(highest?.productNumber || 0) } }, { upsert: true });
+    })();
+  }
+  try { await productSequenceReady; }
+  catch (error) { productSequenceReady = null; throw error; }
+  const sequence = await ProductCounter.findOneAndUpdate({ _id: 'products' }, { $inc: { value: count } }, { new: true, upsert: true });
+  return Array.from({ length: count }, (_unused, index) => sequence.value - count + index + 1);
+}
+
+function nextDemoProductNumber() {
+  return demoProductStore.reduce((maximum, product) => Math.max(maximum, Number(product.productNumber || 0)), 0) + 1;
 }
 
 function normalizeOrder(order) {
@@ -1357,7 +1377,7 @@ app.get('/api/products/oe-mappings', requireAuth, requireManager, async (request
 app.post('/api/products', requireAuth, requireManager, async (request, response, next) => {
   try {
     const product = validateProduct(request.body);
-    const saved = dataSource === 'mongodb' ? await Product.create(product) : (() => { if (demoProductStore.some((item) => item.sku === product.sku)) throw Object.assign(new Error('SKU already exists.'), { status: 409 }); const created = { ...product, id: `p-${Date.now()}` }; demoProductStore.unshift(created); return created; })();
+    const saved = dataSource === 'mongodb' ? await Product.create({ ...product, productNumber: (await reserveProductNumbers())[0] }) : (() => { if (demoProductStore.some((item) => item.sku === product.sku)) throw Object.assign(new Error('SKU already exists.'), { status: 409 }); const created = { ...product, id: `p-${Date.now()}`, productNumber: nextDemoProductNumber() }; demoProductStore.unshift(created); return created; })();
     await invalidateSearchCache(); return response.status(201).json({ product: normalizeProduct(saved) });
   } catch (error) { return next(error); }
 });
@@ -1409,7 +1429,10 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
       try {
         const product = validateProduct(rows[index]);
         const id = String(rows[index]?.id || '').trim();
-        if (id && !mongoose.isValidObjectId(id)) throw Object.assign(new Error('Product ID is invalid. Re-export the warehouse CSV to get the current ID.'), { status: 400 });
+        const idDigits = id.replaceAll(',', '');
+        const productNumber = /^\d+$/.test(idDigits) && Number.isSafeInteger(Number(idDigits)) && Number(idDigits) > 0 ? Number(idDigits) : null;
+        const legacyMongoId = /^[a-f\d]{24}$/i.test(id);
+        if (id && !productNumber && !legacyMongoId) throw Object.assign(new Error('Product ID is invalid. Re-export the warehouse CSV to get the current ID.'), { status: 400 });
         if (!product.locations.length) throw Object.assign(new Error('This SKU has no valid stock quantity row. Fix the qty column before importing.'), { status: 400 });
         const warehouseLocations = product.locations.filter((location) => location.rack !== 'BACKORDER').map((location) => ({ ...location, warehouse }));
         const byRack = new Map();
@@ -1420,23 +1443,27 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
           else byRack.set(key, { ...location });
         }
         const selectedLocations = [...byRack.values()];
-        prepared.push({ index, id, product, selectedLocations });
+        prepared.push({ index, id, productNumber, product, selectedLocations });
       } catch (error) { errors.push({ row: index + 2, sku: rows[index]?.sku || '', error: error.message }); }
     }
     const ids = prepared.map(({ id }) => id).filter(Boolean);
+    const productNumbers = prepared.map(({ productNumber }) => productNumber).filter(Number.isSafeInteger);
+    const legacyMongoIds = ids.filter((id) => /^[a-f\d]{24}$/i.test(id));
     const skus = prepared.map(({ product }) => product.sku);
-    const existingProducts = prepared.length ? await Product.find({ $or: [...(ids.length ? [{ _id: { $in: ids } }] : []), { sku: { $in: skus } }] }).lean() : [];
-    const existingById = new Map(existingProducts.map((product) => [String(product._id), product]));
+    const existingProducts = prepared.length ? await Product.find({ $or: [...(productNumbers.length ? [{ productNumber: { $in: productNumbers } }] : []), ...(legacyMongoIds.length ? [{ _id: { $in: legacyMongoIds } }] : []), { sku: { $in: skus } }] }).lean() : [];
+    const existingById = new Map(existingProducts.filter((product) => product.productNumber).map((product) => [String(product.productNumber), product]));
+    const existingByMongoId = new Map(existingProducts.map((product) => [String(product._id), product]));
     const existingBySku = new Map(existingProducts.map((product) => [product.sku, product]));
     const operations = [];
+    const newProducts = [];
     const claimedSkus = new Set();
-    for (const { index, id, product, selectedLocations } of prepared) {
+    for (const { index, id, productNumber, product, selectedLocations } of prepared) {
       if (claimedSkus.has(product.sku)) {
         errors.push({ row: index + 2, sku: product.sku, error: 'This file contains more than one product with the same SKU.' });
         continue;
       }
       claimedSkus.add(product.sku);
-      const existing = id ? existingById.get(id) : null;
+      const existing = id ? (productNumber ? existingById.get(String(productNumber)) : existingByMongoId.get(id)) : null;
       if (id && !existing) {
         if (updateMatchingOnly) { skipped += 1; continue; }
         errors.push({ row: index + 2, sku: product.sku, error: `Product ID ${id} was not found. IDs are never created or changed by imports.` });
@@ -1446,15 +1473,15 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
         const sameSku = existingBySku.get(product.sku);
         if (sameSku) {
           if (updateMatchingOnly) { skipped += 1; continue; }
-          errors.push({ row: index + 2, sku: product.sku, error: `This SKU already belongs to product ID ${sameSku._id}. Re-export the warehouse and include the ID column to update it.` });
+          errors.push({ row: index + 2, sku: product.sku, error: `This SKU already belongs to product ID ${sameSku.productNumber || sameSku._id}. Re-export the warehouse and include the ID column to update it.` });
           continue;
         }
-        operations.push({ insertOne: { document: { ...product, locations: selectedLocations } } });
+        newProducts.push({ product, selectedLocations });
         continue;
       }
       const skuOwner = existingBySku.get(product.sku);
-      if (skuOwner && String(skuOwner._id) !== id) {
-        errors.push({ row: index + 2, sku: product.sku, error: `This SKU already belongs to another product (ID ${skuOwner._id}).` });
+      if (skuOwner && String(skuOwner._id) !== String(existing._id)) {
+        errors.push({ row: index + 2, sku: product.sku, error: `This SKU already belongs to another product (ID ${skuOwner.productNumber || skuOwner._id}).` });
         continue;
       }
       const retained = (existing.locations || []).filter((location) => location.warehouse !== warehouse || location.rack === 'BACKORDER');
@@ -1487,6 +1514,10 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
       if (fields.has('reorderpoint')) productUpdates.reorderPoint = product.reorderPoint;
       if (['fitments', 'vehiclemake', 'vehiclemodel', 'yearfrom', 'yearto', 'engine'].some((field) => fields.has(field))) productUpdates.vehicleFitment = product.vehicleFitment;
       operations.push({ updateOne: { filter: { _id: existing._id, locations: existing.locations }, update: { $set: { locations: mergedLocations, ...productUpdates } } } });
+    }
+    if (newProducts.length) {
+      const numbers = await reserveProductNumbers(newProducts.length);
+      newProducts.forEach(({ product, selectedLocations }, index) => operations.push({ insertOne: { document: { ...product, productNumber: numbers[index], locations: selectedLocations } } }));
     }
     if (operations.length) {
       const result = await Product.bulkWrite(operations, { ordered: false });
@@ -1529,21 +1560,21 @@ app.get('/api/products/export', requireAuth, requireManager, async (request, res
       if (filterBy === 'category' || filterBy === 'brand') filter[filterBy] = { $regex: `^${escapeRegex(filterValue)}$`, $options: 'i' };
       if (filterBy === 'oe') filter.oe = { $regex: `^${escapeRegex(filterValue)}$`, $options: 'i' };
       const cursor = Product.find(filter)
-        .select('_id sku name brand category unit oe barcode price priceIncludesGst cost reorderPoint vehicleFitment locations')
+        .select('_id productNumber sku name brand category unit oe barcode price priceIncludesGst cost reorderPoint vehicleFitment locations')
         .sort({ sku: 1 }).lean().cursor({ batchSize: 250 });
       for await (const product of cursor) {
         if (!matchesFilter(product)) continue;
         for (const location of product.locations || []) {
           if (location.warehouse !== warehouse) continue;
           const fitment = product.vehicleFitment?.[0] || {};
-          await writeRow([String(product._id), product.sku, product.name, product.brand, product.category, product.unit || 'PCS', (product.oe || []).join('|'), product.barcode, product.price, product.priceIncludesGst, product.cost, product.reorderPoint, warehouse, location.rack, location.qty, fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine, JSON.stringify(product.vehicleFitment || [])]);
+          await writeRow([String(product.productNumber || ''), product.sku, product.name || '', product.brand, product.category, product.unit || 'PCS', (product.oe || []).join('|'), product.barcode, product.price, product.priceIncludesGst, product.cost, product.reorderPoint, warehouse, location.rack, location.qty, fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine, JSON.stringify(product.vehicleFitment || [])]);
         }
       }
     } else {
       for (const product of demoProductStore) for (const location of product.locations || []) {
         if (location.warehouse !== warehouse || !matchesFilter(product)) continue;
         const fitment = product.vehicleFitment?.[0] || {};
-        await writeRow([String(product.id), product.sku, product.name, product.brand, product.category, product.unit || 'PCS', (product.oe || []).join('|'), product.barcode, product.price, product.priceIncludesGst, product.cost, product.reorderPoint, warehouse, location.rack, location.qty, fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine, JSON.stringify(product.vehicleFitment || [])]);
+        await writeRow([String(product.productNumber), product.sku, product.name || '', product.brand, product.category, product.unit || 'PCS', (product.oe || []).join('|'), product.barcode, product.price, product.priceIncludesGst, product.cost, product.reorderPoint, warehouse, location.rack, location.qty, fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine, JSON.stringify(product.vehicleFitment || [])]);
       }
     }
     return response.end();
@@ -1919,8 +1950,8 @@ app.post('/api/integrations/woocommerce/products/pull', requireAuth, requireAdmi
         if (found) {
           if (dataSource === 'mongodb') { found.wooCommerceId = item.id; found.name = data.name; found.brand = data.brand; found.category = data.category; found.oe = data.oe; found.price = data.price; await found.save(); }
           else Object.assign(found, data, { wooCommerceId: item.id });
-        } else if (dataSource === 'mongodb') await Product.create({ ...data, wooCommerceId: item.id });
-        else demoProductStore.push({ ...data, id: `woo-${item.id}`, wooCommerceId: item.id });
+        } else if (dataSource === 'mongodb') await Product.create({ ...data, productNumber: (await reserveProductNumbers())[0], wooCommerceId: item.id });
+        else demoProductStore.push({ ...data, id: `woo-${item.id}`, productNumber: nextDemoProductNumber(), wooCommerceId: item.id });
         imported += 1;
       }
       if (remote.length < 100) break; page += 1;
@@ -2018,7 +2049,7 @@ let sessionSweepTimer;
 async function start() {
   if (process.env.MONGODB_URI) {
     await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 8000, autoIndex: !production }); dataSource = 'mongodb';
-    await Promise.all([Product.createIndexes(), User.createIndexes(), Order.createIndexes(), PaymentLink.createIndexes(), Rack.createIndexes(), SystemSetting.createIndexes(), PackingPhoto.createIndexes(), PushSubscription.createIndexes(), ActivityEvent.createIndexes(), UserSession.createIndexes()]);
+    await Promise.all([Product.createIndexes(), ProductCounter.createIndexes(), User.createIndexes(), Order.createIndexes(), PaymentLink.createIndexes(), Rack.createIndexes(), SystemSetting.createIndexes(), PackingPhoto.createIndexes(), PushSubscription.createIndexes(), ActivityEvent.createIndexes(), UserSession.createIndexes()]);
     await User.updateMany({ role: 'Sales Person' }, { $set: { role: 'Packer', approved: true, active: true } });
     if (process.env.BOOTSTRAP_ADMIN_EMAIL && process.env.BOOTSTRAP_ADMIN_PASSWORD) {
       const email = process.env.BOOTSTRAP_ADMIN_EMAIL.toLowerCase();

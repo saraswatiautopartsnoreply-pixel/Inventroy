@@ -10,6 +10,7 @@
     "start": "node server/index.js",
     "seed:demo": "node server/seed.js",
     "migrate:categories": "node server/migrations/backfill-product-categories.js",
+    "migrate:product-ids": "node server/migrations/migrate-product-numbers.js",
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview"
