@@ -160,6 +160,8 @@ function App() {
   const [searchError, setSearchError] = useState('');
   const [warehouseFilter, setWarehouseFilter] = useState('all');
   const [stockFilter, setStockFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [productCategories, setProductCategories] = useState([]);
   const [modalProduct, setModalProduct] = useState(null);
   const [editingProduct, setEditingProduct] = useState(null);
   const [altProduct, setAltProduct] = useState(null);
@@ -233,9 +235,16 @@ function App() {
   useEffect(() => {
     if (!currentUser || currentUser.role === 'Packer' || !['Inventory', 'Overview'].includes(page) || query.trim().length >= 2) return undefined;
     let active = true;
-    api(`/products?page=${productPage}&limit=${PRODUCT_PAGE_SIZE}`).then((result) => { if (active) { setProducts(result.items); setProductTotal(result.total); } }).catch(() => {});
+    const parameters = new URLSearchParams({ page: String(productPage), limit: String(PRODUCT_PAGE_SIZE), warehouse: page === 'Inventory' ? warehouseFilter : 'all', stock: page === 'Inventory' ? stockFilter : 'all', category: page === 'Inventory' ? categoryFilter : 'all' });
+    api(`/products?${parameters}`).then((result) => { if (active) { setProducts(result.items); setProductTotal(result.total); } }).catch(() => {});
     return () => { active = false; };
-  }, [currentUser, page, productPage, query]);
+  }, [currentUser, page, productPage, query, warehouseFilter, stockFilter, categoryFilter]);
+  useEffect(() => {
+    if (!currentUser || currentUser.role === 'Packer') return undefined;
+    let active = true;
+    api('/products/categories').then((result) => { if (active) setProductCategories(result.items || []); }).catch(() => {});
+    return () => { active = false; };
+  }, [currentUser]);
   useEffect(() => {
     if (page !== 'Team' || currentUser?.role !== 'Admin') return undefined;
     let active = true;
@@ -281,7 +290,8 @@ function App() {
       if (!active) return;
       if (document.visibilityState === 'visible') {
         try {
-          const productRequest = needsProducts ? api(`/products?page=${productPage}&limit=${PRODUCT_PAGE_SIZE}`) : Promise.resolve(null);
+          const productParameters = new URLSearchParams({ page: String(productPage), limit: String(PRODUCT_PAGE_SIZE), warehouse: page === 'Inventory' ? warehouseFilter : 'all', stock: page === 'Inventory' ? stockFilter : 'all', category: page === 'Inventory' ? categoryFilter : 'all' });
+          const productRequest = needsProducts ? api(`/products?${productParameters}`) : Promise.resolve(null);
           const summaryRequest = needsSummary ? api('/products/summary') : Promise.resolve(null);
           const orderRequest = needsOrders ? api('/orders') : Promise.resolve(null);
           const [productResult, summaryResult, orderResult] = await Promise.all([productRequest, summaryRequest, orderRequest]);
@@ -296,8 +306,8 @@ function App() {
     };
     timer = window.setTimeout(poll, 8_000 + Math.random() * 12_000);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [currentUser, page, productPage, query]);
-  useEffect(() => { setProductPage(1); }, [query, warehouseFilter]);
+  }, [currentUser, page, productPage, query, warehouseFilter, stockFilter, categoryFilter]);
+  useEffect(() => { setProductPage(1); }, [query, warehouseFilter, stockFilter, categoryFilter]);
   useEffect(() => {
     const searchTerm = query.trim();
     if (currentUser?.role === 'Packer' || searchTerm.length < 2) {
@@ -308,7 +318,7 @@ function App() {
     setSearchResponse(null); setSearchPending(true); setSearchError('');
     const timer = window.setTimeout(async () => {
       try {
-        const parameters = new URLSearchParams({ q: searchTerm, warehouse: warehouseFilter, page: String(productPage) });
+        const parameters = new URLSearchParams({ q: searchTerm, warehouse: warehouseFilter, stock: stockFilter, category: categoryFilter, page: String(productPage) });
         const response = await fetch(`/api/products/search?${parameters}`, { signal: controller.signal, credentials: 'same-origin', headers: { Accept: 'application/json' } });
         if (!response.ok) throw new Error(`Search API returned ${response.status}`);
         setSearchResponse(await response.json());
@@ -319,7 +329,7 @@ function App() {
       }
     }, 250);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [query, warehouseFilter, currentUser, productPage]);
+  }, [query, warehouseFilter, stockFilter, categoryFilter, currentUser, productPage]);
   useEffect(() => {
     const shortcut = (event) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' || event.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName)) { event.preventDefault(); window.setTimeout(() => searchInputRef.current?.focus(), 0); } };
     window.addEventListener('keydown', shortcut); return () => window.removeEventListener('keydown', shortcut);
@@ -336,6 +346,7 @@ function App() {
       const result = await api(payload.id ? `/products/${encodeURIComponent(payload.id)}` : '/products', { method: payload.id ? 'PUT' : 'POST', body: JSON.stringify(payload) });
       const saved = result.product;
       setProducts((old) => payload.id ? old.map((item) => item.id === saved.id ? saved : item) : [saved, ...old].slice(0, PRODUCT_PAGE_SIZE));
+      if (saved.category) setProductCategories((old) => [...new Set([...old, saved.category])].sort((left, right) => left.localeCompare(right)));
       if (!payload.id) setProductTotal((count) => count + 1);
       addActivity(payload.id ? 'Updated product' : 'Added product', `${saved.sku} · ${saved.name}`);
       setModalProduct(null); setToast(payload.id ? 'Product updated' : 'Product added');
@@ -369,11 +380,18 @@ function App() {
   const filteredProducts = searchProducts.filter((p) => {
     const warehouseMatch = warehouseFilter === 'all' || p.locations.some((loc) => loc.warehouse === warehouseFilter);
     const quantity = availableFor(p, warehouseFilter);
-    const stockMatch = stockFilter === 'all' || (stockFilter === 'in' && quantity > 0) || (stockFilter === 'out' && quantity === 0) || (stockFilter === 'low' && quantity > 0 && quantity <= 5);
-    return warehouseMatch && stockMatch;
+    const stockMatch = stockFilter === 'all' || (stockFilter === 'in' && quantity > 0) || (stockFilter === 'out' && quantity <= 0) || (stockFilter === 'low' && quantity > 0 && quantity <= Number(p.reorderPoint || 5));
+    return warehouseMatch && stockMatch && (categoryFilter === 'all' || p.category === categoryFilter);
   }).slice(0, PRODUCT_PAGE_SIZE);
   const openEdit = (product) => { if (canEdit) { setEditingProduct(product); setModalProduct(product); } };
-  const showAlternatives = (product, matches = products) => setAltProduct({ product, products: matches });
+  const showAlternatives = (product, matches = products) => {
+    setAltProduct({ product, products: matches });
+    if (!product?.sku) return;
+    const parameters = new URLSearchParams({ q: product.sku, warehouse: 'all', page: '1' });
+    api(`/products/search?${parameters}`).then((result) => {
+      if (result.items?.length) setAltProduct((current) => current?.product.id === product.id ? { ...current, products: result.items } : current);
+    }).catch(() => {});
+  };
   const navClick = (name) => { if (currentUser?.role === 'Packer' && !['Orders', 'Packing'].includes(name)) return; setPage(name); setMenuOpen(false); setQuery(''); };
   const addNewProduct = () => { setEditingProduct(null); setModalProduct({}); };
   const loadPackers = async (warehouse) => { const requestId = ++packerRequestRef.current; setPackerLoading(true); setPackers([]); try { const result = await api(`/users/packers?warehouse=${encodeURIComponent(warehouse)}`); if (requestId === packerRequestRef.current) setPackers(result.items); return result.items; } catch (failure) { if (requestId === packerRequestRef.current) { setPackers([]); setToast(failure.message); } return []; } finally { if (requestId === packerRequestRef.current) setPackerLoading(false); } };
@@ -523,15 +541,17 @@ function App() {
     </aside>
     {menuOpen && <button className="mobile-scrim" onClick={() => setMenuOpen(false)} aria-label="Close navigation" />}
     <main className="main-content">
-      <header className="topbar"><button className="mobile-menu icon-button" onClick={() => setMenuOpen(true)} aria-label="Open navigation"><Menu size={20} /></button>{currentUser.role !== 'Packer' && <label className="global-search"><Search size={19} /><input ref={searchInputRef} value={query} onChange={(event) => { setQuery(event.target.value); if (page !== 'Inventory') setPage('Inventory'); }} placeholder="Search part number, OE number, brand or vehicle" aria-label="Search inventory" /><kbd>/</kbd></label>}<div className="topbar-right"><span className="topbar-date">{new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</span><span className="topbar-avatar">{currentUser.name.slice(0, 1)}</span></div></header>
+      <header className="topbar"><button className="mobile-menu icon-button" onClick={() => setMenuOpen(true)} aria-label="Open navigation"><Menu size={20} /></button>{currentUser.role !== 'Packer' && page !== 'Inventory' && <label className="global-search"><Search size={19} /><input ref={searchInputRef} value={query} onChange={(event) => { setQuery(event.target.value); if (page !== 'Inventory') setPage('Inventory'); }} placeholder="Search part number, OE number, brand or vehicle" aria-label="Search inventory" /><kbd>/</kbd></label>}<div className="topbar-right"><span className="topbar-date">{new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</span><span className="topbar-avatar">{currentUser.name.slice(0, 1)}</span></div></header>
       <div className="page-wrap" key={page}>
         {page === 'Inventory' && <>
           <section className="page-heading"><div><h1>Inventory</h1><p>Track parts across every warehouse.</p></div>{canEdit && <button className="button button-primary" onClick={addNewProduct}><Plus size={17} /> Add product</button>}</section>
-          <section className="toolbar" aria-label="Inventory filters"><label className="search-field"><Search size={18} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search SKU, brand or OE number…" /><kbd>⌘ K</kbd></label><label className="select-field"><MapPin size={16} /><select value={warehouseFilter} onChange={(e) => setWarehouseFilter(e.target.value)}><option value="all">All warehouses</option>{warehouses.map((w) => <option key={w.code} value={w.code}>{w.code} · {w.name}</option>)}</select><ChevronDown size={15} /></label><label className="select-field stock-select"><SlidersHorizontal size={16} /><select value={stockFilter} onChange={(e) => setStockFilter(e.target.value)}><option value="all">All stock</option><option value="in">In stock</option><option value="low">Low stock</option><option value="out">Out of stock</option></select><ChevronDown size={15} /></label></section>
+          <section className="inventory-filters" aria-label="Inventory filters">
+            <div className="inventory-filter-controls"><label className="inventory-filter-search"><Search size={17} /><input ref={searchInputRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search name, part no., OE no. or brand" /></label><label className="inventory-filter-select"><MapPin size={16} /><select value={warehouseFilter} onChange={(e) => setWarehouseFilter(e.target.value)}><option value="all">All warehouses</option>{warehouses.map((w) => <option key={w.code} value={w.code}>{w.code} · {w.name}</option>)}</select><ChevronDown size={15} /></label><label className="inventory-filter-select"><select value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}><option value="all">All categories</option>{productCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select><ChevronDown size={15} /></label><span className="inventory-filter-count">{productTotal.toLocaleString('en-IN')} parts</span></div>
+            <div className="inventory-filter-tabs" role="tablist" aria-label="Filter by stock status">{[['all', 'All'], ['in', 'In stock'], ['low', 'Low stock'], ['out', 'Out of stock']].map(([value, label]) => <button key={value} type="button" role="tab" aria-selected={stockFilter === value} className={stockFilter === value ? 'active' : ''} onClick={() => setStockFilter(value)}>{label}</button>)}</div>
+          </section>
           {searchPending && <p className="search-feedback" role="status">Searching products…</p>}
           {!searchPending && searchError && <p className="search-feedback search-fallback" role="status">{searchError}</p>}
           {!searchPending && searchResponse && query.trim().length >= 2 && <p className="search-feedback" role="status">{searchResponse.total} match{searchResponse.total === 1 ? '' : 'es'} · {searchResponse.source === 'mongodb' ? 'MongoDB' : 'demo search'}{searchResponse.cached ? ' · Redis cache' : ''}</p>}
-          <section className="summary-strip"><div><span>Total SKUs</span><strong>{productTotal.toLocaleString('en-IN')}</strong></div><div><span>Units on hand</span><strong>{totalUnits.toLocaleString('en-IN')}</strong></div><div><span>Low stock</span><strong className="summary-green">{lowStock}</strong></div><div><span>Warehouses</span><strong className="summary-green">{warehouses.length}</strong></div></section>
           <InventoryTable products={filteredProducts} allProducts={searchProducts} warehouseFilter={warehouseFilter} canEdit={canEdit} allowZeroStockSales={systemSettings.allowZeroStockSales} page={productPage} pageSize={PRODUCT_PAGE_SIZE} total={query.trim().length >= 2 && searchResponse ? searchResponse.total : productTotal} onPageChange={setProductPage} searching={query.trim().length >= 2} onEdit={openEdit} onAlternatives={showAlternatives} onSell={openQuickSell} onDelete={deleteProduct} />
         </>}
         {page === 'Overview' && <Overview products={products} totalSkus={productTotal} productSummary={productSummary} activity={activity} orders={orders} report={salesReport} totalUnits={totalUnits} lowStock={lowStock} canEdit={canEdit} allowZeroStockSales={systemSettings.allowZeroStockSales} onInventory={() => navClick('Inventory')} onImport={() => navClick('Import / export')} onAddProduct={addNewProduct} onSell={openQuickSell} onPacking={() => navClick('Packing')} onActivity={() => navClick('Activity')} onSalesHistory={() => navClick('Sales history')} onOpenProduct={(product) => { setQuery(product.sku); setPage('Inventory'); }} />}
@@ -565,10 +585,22 @@ function App() {
 }
 
 function InventoryTable({ products, allProducts, warehouseFilter, canEdit, allowZeroStockSales, page, pageSize, total, onPageChange, searching, onEdit, onAlternatives, onSell, onDelete }) {
-  return <section className="table-region"><div className="table-scroll"><table className="inventory-table"><colgroup><col className="inventory-col-product" /><col className="inventory-col-sku" /><col className="inventory-col-brand" /><col className="inventory-col-oe" /><col className="inventory-col-available" /><col className="inventory-col-location" /><col className="inventory-col-barcode" /><col className="inventory-col-actions" /></colgroup><thead><tr><th>Product</th><th>SKU</th><th>Brand</th><th>OE number</th><th>Available</th><th>Location</th><th>Barcode</th><th>Actions</th></tr></thead><tbody>{products.map((product) => { const qty = product.locations.filter((location) => warehouseFilter === 'all' || location.warehouse === warehouseFilter).reduce((sum, location) => sum + Number(location.qty || 0) - Number(location.reserved || 0), 0); return <tr key={product.id}>
-    <td className="product-cell"><button className="product-name" onClick={() => canEdit && onEdit(product)}>{product.name}</button>{allProducts.some((other) => other.id !== product.id && other.oe.some((oe) => product.oe.includes(oe))) && <button className="alt-link" onClick={() => onAlternatives(product, allProducts)}>{allProducts.filter((p) => p.id !== product.id && p.oe.some((oe) => product.oe.includes(oe))).length} alternatives <ChevronRight size={13} /></button>}</td>
-    <td className="mono sku-cell" title={product.sku}>{product.sku}</td><td className="brand-cell" title={product.brand}>{product.brand}</td><td className="mono oe-value" title={product.oe.join(", ")}>{product.oe.join(', ') || '—'}</td><td><span className={`quantity ${qty < 0 ? 'qty-backorder' : qty === 0 ? 'qty-zero' : qty <= 5 ? 'qty-low' : 'qty-good'}`}>{qty} {product.unit || 'PCS'}</span>{qty < 0 && <span className="low-note">Backorder</span>}{qty > 0 && qty <= 5 && <span className="low-note">Low stock</span>}</td><td className="location-cell">{product.locations.filter((loc) => warehouseFilter === 'all' || loc.warehouse === warehouseFilter).map((loc) => <span key={`${loc.warehouse}-${loc.rack}`}>{loc.warehouse ? <><b>{loc.warehouse}</b>{loc.rack && <> ? {loc.rack === 'BACKORDER' ? 'Backorder' : loc.rack}</>}</> : loc.rack}</span>)}</td><td><BarcodeMark value={product.barcode} compact /></td><td className="inventory-actions">{canEdit && <button className="row-action sell-action" disabled={!availableFor(product) && !allowZeroStockSales} onClick={() => onSell(product)} title={!qty && !allowZeroStockSales ? 'Zero-stock sales are disabled in System settings' : `Sell ${product.name}`}><ShoppingCart size={15} /><span>Sell</span></button>}<button className="row-action icon-button" onClick={() => onAlternatives(product, allProducts)} title="View OE alternatives" aria-label={`Compare alternatives for ${product.name}`}><ArrowDownUp size={15} /></button>{canEdit && <button className="row-action delete-action" onClick={() => onDelete(product)} title={`Delete ${product.name}`} aria-label={`Delete ${product.name}`}><Trash2 size={15} /></button>}</td>
-  </tr>; })}{!products.length && <tr><td className="no-results" colSpan="8"><Search size={20} /><strong>No matching products</strong><span>Try a different SKU, OE number, barcode or warehouse filter.</span></td></tr>}</tbody></table></div><footer className="table-footer"><span>Showing <strong>{total ? `${((page - 1) * pageSize + 1).toLocaleString('en-IN')} to ${Math.min(page * pageSize, total).toLocaleString('en-IN')}` : '0'}</strong> of <strong>{total.toLocaleString('en-IN')}</strong> products{searching ? ' matching search' : ''}</span><div className="pagination"><button className="page-arrow" disabled={page <= 1} aria-label="Previous page" onClick={() => onPageChange((value) => Math.max(1, value - 1))}><ChevronLeft size={17} /></button><button className="page-current">{page}</button><button className="page-arrow" disabled={page * pageSize >= total} aria-label="Next page" onClick={() => onPageChange((value) => value + 1)}><ChevronRight size={17} /></button></div></footer></section>;
+  const [contextMenu, setContextMenu] = useState(null);
+  useEffect(() => {
+    if (!contextMenu) return undefined;
+    const close = (event) => { if (event.type === 'keydown' && event.key !== 'Escape') return; setContextMenu(null); };
+    window.addEventListener('click', close); window.addEventListener('keydown', close);
+    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', close); };
+  }, [contextMenu]);
+  return <section className="table-region"><div className="table-scroll"><table className="inventory-table"><colgroup><col className="inventory-col-product" /><col className="inventory-col-sku" /><col className="inventory-col-oe" /><col className="inventory-col-brand" /><col className="inventory-col-available" /><col className="inventory-col-location" /><col className="inventory-col-actions" /></colgroup><thead><tr><th>Product</th><th>SKU</th><th>OE</th><th>Brand</th><th>Qty</th><th>Location</th><th>Action</th></tr></thead><tbody>{products.map((product) => {
+    const qty = product.locations.filter((location) => warehouseFilter === 'all' || location.warehouse === warehouseFilter).reduce((sum, location) => sum + Number(location.qty || 0) - Number(location.reserved || 0), 0);
+    const displayName = product.brand && product.sku ? product.brand + ' + ' + product.sku : product.name || product.sku || product.brand || 'Unnamed product';
+    const alternatives = allProducts.filter((item) => item.id !== product.id && item.oe.some((oe) => product.oe.includes(oe)));
+    return <tr key={product.id} onContextMenu={(event) => { if (!canEdit) return; event.preventDefault(); setContextMenu({ product, x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 115) }); }}>
+      <td className="product-cell"><button className="product-name" onClick={() => onAlternatives(product, allProducts)} onContextMenu={(event) => { if (!canEdit) return; event.preventDefault(); setContextMenu({ product, x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 115) }); }} title={canEdit ? 'Click to view OE alternatives ? right-click to edit or delete' : 'View OE alternatives'}>{displayName}</button>{alternatives.length > 0 && <button className="alt-link" onClick={() => onAlternatives(product, allProducts)}>{alternatives.length} alternatives <ChevronRight size={13} /></button>}</td>
+      <td className="mono sku-cell" title={product.sku}>{product.sku || '?'}</td><td className="mono oe-value" title={product.oe.join(', ')}>{product.oe.join(', ') || '?'}</td><td className="brand-cell" title={product.brand}>{product.brand || '?'}</td><td><span className={'quantity ' + (qty < 0 ? 'qty-backorder' : qty === 0 ? 'qty-zero' : qty <= Number(product.reorderPoint || 5) ? 'qty-low' : 'qty-good')}>{qty} {product.unit || 'PCS'}</span>{qty < 0 && <span className="low-note">Backorder</span>}{qty > 0 && qty <= Number(product.reorderPoint || 5) && <span className="low-note">Low stock</span>}</td><td className="location-cell">{product.locations.filter((loc) => warehouseFilter === 'all' || loc.warehouse === warehouseFilter).map((loc) => <span key={loc.warehouse + '-' + loc.rack}>{loc.warehouse ? <><b>{loc.warehouse}</b>{loc.rack && <> ? {loc.rack === 'BACKORDER' ? 'Backorder' : loc.rack}</>}</> : loc.rack}</span>)}</td><td className="inventory-actions">{canEdit && <button className="row-action sell-action" disabled={qty <= 0 && !allowZeroStockSales} onClick={() => onSell(product)} title={qty <= 0 && !allowZeroStockSales ? 'Zero-stock sales are disabled in System settings' : 'Sell ' + displayName}><ShoppingCart size={15} /><span>Sell</span></button>}</td>
+    </tr>;
+  })}{!products.length && <tr><td className="no-results" colSpan="7"><Search size={20} /><strong>No matching products</strong><span>Try a different SKU, OE number, barcode or warehouse filter.</span></td></tr>}</tbody></table></div><footer className="table-footer"><span>Showing <strong>{total ? ((page - 1) * pageSize + 1).toLocaleString('en-IN') + ' to ' + Math.min(page * pageSize, total).toLocaleString('en-IN') : '0'}</strong> of <strong>{total.toLocaleString('en-IN')}</strong> products{searching ? ' matching search' : ''}</span><div className="pagination"><button className="page-arrow" disabled={page <= 1} aria-label="Previous page" onClick={() => onPageChange((value) => Math.max(1, value - 1))}><ChevronLeft size={17} /></button><button className="page-current">{page}</button><button className="page-arrow" disabled={page * pageSize >= total} aria-label="Next page" onClick={() => onPageChange((value) => value + 1)}><ChevronRight size={17} /></button></div></footer>{contextMenu && <div className="inventory-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onClick={(event) => event.stopPropagation()}><button role="menuitem" onClick={() => { const product = contextMenu.product; setContextMenu(null); onEdit(product); }}><FileSpreadsheet size={15} /> Edit product</button><button role="menuitem" className="context-delete" onClick={() => { const product = contextMenu.product; setContextMenu(null); onDelete(product); }}><Trash2 size={15} /> Delete product</button></div>}</section>;
 }
 
 function Overview({ products, totalSkus, productSummary, activity, orders, report, totalUnits, lowStock, canEdit, allowZeroStockSales, onInventory, onImport, onAddProduct, onSell, onPacking, onActivity, onSalesHistory, onOpenProduct }) {

@@ -132,6 +132,34 @@ function escapeRegex(value) { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'
 // Treat spaces and common part-number separators as formatting, so e.g. AU-BS101
 // and AUBS101 resolve to the same search term without changing stored SKUs/OEs.
 function normalizeSearchValue(value) { return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
+function inventoryAvailabilityExpression(warehouse) {
+  const input = { $ifNull: ['$locations', []] };
+  const locations = warehouse && warehouse !== 'ALL'
+    ? { $filter: { input, as: 'loc', cond: { $eq: ['$$loc.warehouse', warehouse] } } }
+    : input;
+  return { $sum: { $map: { input: locations, as: 'loc', in: { $subtract: [{ $ifNull: ['$$loc.qty', 0] }, { $ifNull: ['$$loc.reserved', 0] }] } } } };
+}
+function addInventoryFilters(criteria, { warehouse = 'ALL', category = 'ALL', stock = 'ALL' } = {}) {
+  if (warehouse !== 'ALL') criteria.locations = { $elemMatch: { warehouse } };
+  if (category !== 'ALL') criteria.category = new RegExp(`^${escapeRegex(category)}$`, 'i');
+  if (stock !== 'ALL') {
+    const available = inventoryAvailabilityExpression(warehouse);
+    if (stock === 'IN') criteria.$expr = { $gt: [available, 0] };
+    if (stock === 'OUT') criteria.$expr = { $lte: [available, 0] };
+    if (stock === 'LOW') criteria.$expr = { $and: [{ $gt: [available, 0] }, { $lte: [available, { $ifNull: ['$reorderPoint', 5] }] }] };
+  }
+  return criteria;
+}
+function demoAvailable(product, warehouse = 'ALL') {
+  return (product.locations || []).filter((location) => warehouse === 'ALL' || location.warehouse === warehouse).reduce((sum, location) => sum + Number(location.qty || 0) - Number(location.reserved || 0), 0);
+}
+function demoMatchesInventoryFilters(product, filters) {
+  const categoryMatch = filters.category === 'ALL' || String(product.category || '').toLocaleLowerCase() === filters.category.toLocaleLowerCase();
+  const quantity = demoAvailable(product, filters.warehouse);
+  const reorderPoint = Number(product.reorderPoint || 5);
+  const stockMatch = filters.stock === 'ALL' || (filters.stock === 'IN' && quantity > 0) || (filters.stock === 'OUT' && quantity <= 0) || (filters.stock === 'LOW' && quantity > 0 && quantity <= reorderPoint);
+  return categoryMatch && stockMatch && (filters.warehouse === 'ALL' || (product.locations || []).some((location) => location.warehouse === filters.warehouse));
+}
 function flexibleSearchRegex(value, exact = false) {
   const characters = [...normalizeSearchValue(value)];
   if (!characters.length) return null;
@@ -1122,15 +1150,21 @@ app.get('/api/products', requireAuth, requireManager, async (_request, response,
   try {
     const page = Math.max(1, Math.floor(Number(_request.query.page) || 1));
     const limit = Math.min(25, Math.max(1, Math.floor(Number(_request.query.limit) || 25)));
+    const warehouse = String(_request.query.warehouse || 'all').toUpperCase();
+    const category = String(_request.query.category || 'all').trim().slice(0, 100).toUpperCase();
+    const stock = String(_request.query.stock || 'all').toUpperCase();
+    if (!['ALL', 'KG', 'SPB', 'BG', 'PB'].includes(warehouse) || !['ALL', 'IN', 'LOW', 'OUT'].includes(stock)) return response.status(400).json({ error: 'Invalid inventory filter.' });
     const version = await getProductCacheVersion();
-    const key = `stockroom:catalog:v1:${version}:page:${page}:limit:${limit}`;
+    const filterDigest = createHash('sha256').update(`${warehouse}|${category}|${stock}`).digest('hex').slice(0, 16);
+    const key = `stockroom:catalog:v2:${version}:${filterDigest}:page:${page}:limit:${limit}`;
     const result = await cachedJson(key, productQueryCacheSeconds, async () => {
+      const filters = { warehouse, category, stock };
       if (dataSource !== 'mongodb') {
-        const active = demoProductStore.filter((product) => product.active !== false);
+        const active = demoProductStore.filter((product) => product.active !== false && demoMatchesInventoryFilters(product, filters));
         const items = active.toSorted((a, b) => a.sku.localeCompare(b.sku)).slice((page - 1) * limit, page * limit);
         return { items, total: active.length, page, pageSize: limit };
       }
-      const criteria = { active: { $ne: false } };
+      const criteria = addInventoryFilters({ active: { $ne: false } }, filters);
       const [items, total] = await Promise.all([
         Product.find(criteria).select('-__v').sort({ sku: 1 }).skip((page - 1) * limit).limit(limit).lean(),
         Product.countDocuments(criteria),
@@ -1141,6 +1175,19 @@ app.get('/api/products', requireAuth, requireManager, async (_request, response,
     return response.json(result.value);
   }
   catch (error) { next(error); }
+});
+
+app.get('/api/products/categories', requireAuth, requireManager, async (_request, response, next) => {
+  try {
+    const version = await getProductCacheVersion();
+    const result = await cachedJson(`stockroom:catalog-categories:v1:${version}`, 300, async () => {
+      const categories = dataSource === 'mongodb'
+        ? await Product.distinct('category', { active: { $ne: false }, category: { $type: 'string', $ne: '' } })
+        : demoProductStore.filter((product) => product.active !== false).map((product) => product.category);
+      return { items: [...new Set(categories.map((value) => String(value || '').trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right)) };
+    });
+    return response.json(result.value);
+  } catch (error) { return next(error); }
 });
 
 app.get('/api/products/summary', requireAuth, requireManager, async (_request, response, next) => {
@@ -1206,13 +1253,16 @@ app.get('/api/products/search', requireAuth, requireManager, async (request, res
   try {
     const query = String(request.query.q || '').trim().slice(0, 100);
     const warehouse = String(request.query.warehouse || 'all').toUpperCase();
+    const category = String(request.query.category || 'all').trim().slice(0, 100).toUpperCase();
+    const stock = String(request.query.stock || 'all').toUpperCase();
     if (!['ALL', 'KG', 'SPB', 'BG', 'PB'].includes(warehouse)) return response.status(400).json({ error: 'Unknown warehouse.' });
+    if (!['ALL', 'IN', 'LOW', 'OUT'].includes(stock)) return response.status(400).json({ error: 'Unknown stock filter.' });
     if (query.length < 2) return response.json({ items: [], total: 0, query, warehouse: warehouse.toLowerCase(), source: dataSource });
     const page = Math.max(1, Math.floor(Number(request.query.page) || 1)); const pageSize = 25;
     const normalizedQuery = normalizeSearchValue(query);
     const version = await getProductCacheVersion();
-    const cacheDigest = createHash('sha256').update(`${dataSource}|${warehouse}|${normalizedQuery || query.toLocaleLowerCase()}|${page}`).digest('hex');
-    const cacheKey = `stockroom:search:v3:${version}:${cacheDigest}`;
+    const cacheDigest = createHash('sha256').update(`${dataSource}|${warehouse}|${category}|${stock}|${normalizedQuery || query.toLocaleLowerCase()}|${page}`).digest('hex');
+    const cacheKey = `stockroom:search:v4:${version}:${cacheDigest}`;
     const result = await cachedJson(cacheKey, cacheTtlSeconds, async () => {
       let items; let total;
       if (dataSource === 'mongodb') {
@@ -1220,13 +1270,12 @@ app.get('/api/products/search', requireAuth, requireManager, async (request, res
         const flexibleExpression = flexibleSearchRegex(query);
         const searchExpressions = flexibleExpression ? [expression, flexibleExpression] : [expression];
         const fields = ['sku', 'barcode', 'brand', 'name', 'oe', 'category', 'vehicleFitment.make', 'vehicleFitment.model'];
-        const criteria = { $or: fields.flatMap((field) => searchExpressions.map((pattern) => ({ [field]: pattern }))) };
-        if (warehouse !== 'ALL') criteria.locations = { $elemMatch: { warehouse } };
+        const criteria = addInventoryFilters({ active: { $ne: false }, $or: fields.flatMap((field) => searchExpressions.map((pattern) => ({ [field]: pattern }))) }, { warehouse, category, stock });
         const exactIdentifier = flexibleSearchRegex(query, true);
         const directIdentifier = query.toUpperCase();
-        const directProduct = await Product.findOne({ active: { $ne: false }, $or: [{ sku: directIdentifier }, { barcode: query }] }).lean();
+        const directProduct = await Product.findOne(addInventoryFilters({ active: { $ne: false }, $or: [{ sku: directIdentifier }, { barcode: query }] }, { warehouse, category, stock })).lean();
         const exactProduct = directProduct || (exactIdentifier
-          ? await Product.findOne({ active: { $ne: false }, $or: [{ sku: exactIdentifier }, { barcode: exactIdentifier }, { oe: exactIdentifier }] }).lean()
+          ? await Product.findOne(addInventoryFilters({ active: { $ne: false }, $or: [{ sku: exactIdentifier }, { barcode: exactIdentifier }, { oe: exactIdentifier }] }, { warehouse, category, stock })).lean()
           : null);
         if (exactProduct && (warehouse === 'ALL' || exactProduct.locations.some((location) => location.warehouse === warehouse))) {
           const exactOe = exactProduct.oe || [];
@@ -1237,7 +1286,7 @@ app.get('/api/products/search', requireAuth, requireManager, async (request, res
               { oe: { $in: exactOe.map((oe) => flexibleSearchRegex(oe, true)).filter(Boolean) } },
             ],
           } : { _id: exactProduct._id };
-          if (warehouse !== 'ALL') linkedCriteria.locations = { $elemMatch: { warehouse } };
+          addInventoryFilters(linkedCriteria, { warehouse, category, stock });
           const linked = await Product.find(linkedCriteria).sort({ sku: 1 }).lean();
           const linkedProducts = linked.map(normalizeProduct);
           if (!linkedProducts.some((product) => product.id === String(exactProduct._id))) linkedProducts.push(normalizeProduct(exactProduct));
@@ -1255,7 +1304,7 @@ app.get('/api/products/search', requireAuth, requireManager, async (request, res
           const fieldMatch = normalized
             ? fields.some((value) => normalizeSearchValue(value).includes(normalized))
             : fields.some((value) => String(value || '').toLocaleLowerCase().includes(query.toLocaleLowerCase()));
-          return fieldMatch && (warehouse === 'ALL' || product.locations.some((location) => location.warehouse === warehouse));
+          return fieldMatch && demoMatchesInventoryFilters(product, { warehouse, category, stock });
         });
         total = matched.length; items = matched.slice((page - 1) * pageSize, page * pageSize);
       }
