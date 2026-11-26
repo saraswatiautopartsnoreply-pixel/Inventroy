@@ -11,6 +11,7 @@
     "seed:demo": "node server/seed.js",
     "migrate:categories": "node server/migrations/backfill-product-categories.js",
     "migrate:product-ids": "node server/migrations/migrate-product-numbers.js",
+    "migrate:clear-product-names": "node server/migrations/clear-product-names.js",
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview"

@@ -146,6 +146,7 @@ function App() {
   const [productPage, setProductPage] = useState(1);
   const [productTotal, setProductTotal] = useState(demoProducts.length);
   const [productSummary, setProductSummary] = useState(null);
+  const [inventoryRevision, setInventoryRevision] = useState(0);
   const [users, setUsers] = useState(() => readStore('users', demoUsers));
   const [activity, setActivity] = useState(() => readStore('activity', demoActivity));
   const [auditActivity, setAuditActivity] = useState({ events: [], sessions: [], retentionDays: 210 });
@@ -243,13 +244,13 @@ function App() {
     const parameters = new URLSearchParams({ page: String(productPage), limit: String(PRODUCT_PAGE_SIZE), warehouse: page === 'Inventory' ? warehouseFilter : 'all', stock: page === 'Inventory' ? stockFilter : 'all', category: page === 'Inventory' ? categoryFilter : 'all' });
     api(`/products?${parameters}`).then((result) => { if (active) { setProducts(result.items); setProductTotal(result.total); } }).catch(() => {});
     return () => { active = false; };
-  }, [currentUser, page, productPage, query, warehouseFilter, stockFilter, categoryFilter]);
+  }, [currentUser, page, productPage, query, warehouseFilter, stockFilter, categoryFilter, inventoryRevision]);
   useEffect(() => {
     if (!currentUser || currentUser.role === 'Packer') return undefined;
     let active = true;
     api('/products/categories').then((result) => { if (active) setProductCategories(result.items || []); }).catch(() => {});
     return () => { active = false; };
-  }, [currentUser]);
+  }, [currentUser, inventoryRevision]);
   useEffect(() => {
     if (page !== 'Team' || currentUser?.role !== 'Admin') return undefined;
     let active = true;
@@ -311,7 +312,7 @@ function App() {
     };
     timer = window.setTimeout(poll, 8_000 + Math.random() * 12_000);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [currentUser, page, productPage, query, warehouseFilter, stockFilter, categoryFilter]);
+  }, [currentUser, page, productPage, query, warehouseFilter, stockFilter, categoryFilter, inventoryRevision]);
   useEffect(() => { setProductPage(1); }, [query, warehouseFilter, stockFilter, categoryFilter]);
   useEffect(() => {
     const searchTerm = query.trim();
@@ -334,7 +335,7 @@ function App() {
       }
     }, 250);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [query, warehouseFilter, stockFilter, categoryFilter, currentUser, productPage]);
+  }, [query, warehouseFilter, stockFilter, categoryFilter, currentUser, productPage, inventoryRevision]);
   useEffect(() => {
     const shortcut = (event) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' || event.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName)) { event.preventDefault(); window.setTimeout(() => searchInputRef.current?.focus(), 0); } };
     window.addEventListener('keydown', shortcut); return () => window.removeEventListener('keydown', shortcut);
@@ -351,8 +352,11 @@ function App() {
       const result = await api(payload.id ? `/products/${encodeURIComponent(payload.id)}` : '/products', { method: payload.id ? 'PUT' : 'POST', body: JSON.stringify(payload) });
       const saved = result.product;
       setProducts((old) => payload.id ? old.map((item) => item.id === saved.id ? saved : item) : [saved, ...old].slice(0, PRODUCT_PAGE_SIZE));
+      setSearchResponse((old) => old ? { ...old, items: payload.id ? old.items.map((item) => item.id === saved.id ? saved : item) : old.items, total: payload.id ? old.total : old.total + 1 } : old);
       if (saved.category) setProductCategories((old) => [...new Set([...old, saved.category])].sort((left, right) => left.localeCompare(right)));
       if (!payload.id) setProductTotal((count) => count + 1);
+      setInventoryRevision((revision) => revision + 1);
+      api('/products/summary').then(setProductSummary).catch(() => {});
       addActivity(payload.id ? 'Updated product' : 'Added product', `${saved.sku} · ${productDisplayName(saved)}`);
       setModalProduct(null); setToast(payload.id ? 'Product updated' : `Product added · ID ${displayProductNumber(saved)}`);
     } catch (failure) { setToast(failure.message); }
@@ -364,7 +368,10 @@ function App() {
     try {
       await api(`/products/${encodeURIComponent(product.id)}`, { method: 'DELETE' });
       setProducts((old) => old.filter((item) => item.id !== product.id));
+      setSearchResponse((old) => old ? { ...old, items: old.items.filter((item) => item.id !== product.id), total: Math.max(0, old.total - 1) } : old);
       setProductTotal((count) => Math.max(0, count - 1));
+      setInventoryRevision((revision) => revision + 1);
+      api('/products/summary').then(setProductSummary).catch(() => {});
       addActivity('Deleted product', `${product.sku} · ${productDisplayName(product)}`);
       if (editingProduct?.id === product.id) { setEditingProduct(null); setModalProduct(null); }
       setToast(`${product.sku} deleted`);
