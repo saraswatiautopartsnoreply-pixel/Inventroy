@@ -170,13 +170,17 @@ function flexibleSearchRegex(value, exact = false) {
 function normalizeProduct(product) {
   const value = typeof product.toObject === 'function' ? product.toObject() : product;
   return {
-    id: String(value._id || value.id), name: value.name, sku: value.sku, brand: value.brand,
+    id: String(value._id || value.id), name: value.name || '', sku: value.sku, brand: value.brand,
     category: value.category || 'General', unit: value.unit || 'PCS', vehicleFitment: value.vehicleFitment || [],
     oe: Array.isArray(value.oe) ? value.oe : [], price: Number(value.price || 0), priceIncludesGst: Boolean(value.priceIncludesGst),
     cost: Number(value.cost || 0), reorderPoint: Number(value.reorderPoint || 0), barcode: value.barcode || '',
     locations: Array.isArray(value.locations) ? value.locations.map((location) => ({ warehouse: location.warehouse, rack: location.rack, qty: Number(location.qty || 0), reserved: Number(location.reserved || 0) })) : [],
     wooCommerceId: value.wooCommerceId || null, updatedAt: value.updatedAt ? new Date(value.updatedAt).toISOString() : '',
   };
+}
+
+function productLabel(product) {
+  return String(product?.name || '').trim() || [product?.brand, product?.sku].filter(Boolean).join(' ') || 'Unnamed product';
 }
 
 function normalizeOrder(order) {
@@ -386,7 +390,7 @@ function validateProduct(input) {
   const sku = String(input.sku || '').trim().toUpperCase();
   const name = String(input.name || '').trim();
   const brand = String(input.brand || '').trim();
-  if (!sku || !name || !brand) throw Object.assign(new Error('Name, SKU and brand are required.'), { status: 400 });
+  if (!sku || !brand) throw Object.assign(new Error('SKU and brand are required.'), { status: 400 });
   const locations = (input.locations || []).map((location) => {
     const rawRack = String(location.rack || '').trim();
     const rack = /^G-\d+[A-E]$/i.test(rawRack) ? rawRack.toUpperCase() : rawRack;
@@ -406,7 +410,7 @@ function validateProduct(input) {
     engine: String(item.engine || '').trim(),
   })) : [];
   return {
-    name, sku, brand, category: String(input.category || 'General').trim().slice(0, 100),
+    name: name.slice(0, 160), sku, brand, category: String(input.category || 'General').trim().slice(0, 100),
     unit: String(input.unit || 'PCS').trim().toUpperCase().slice(0, 20) || 'PCS',
     vehicleFitment: fitments, oe: Array.isArray(input.oe) ? [...new Set(input.oe.map((item) => String(item).trim().toUpperCase()).filter(Boolean))].slice(0, 50) : [],
     price: Math.max(0, Number(input.price || 0)), priceIncludesGst: Boolean(input.priceIncludesGst), cost: Math.max(0, Number(input.cost || 0)),
@@ -1363,7 +1367,7 @@ app.put('/api/products/:id', requireAuth, requireManager, async (request, respon
     const updated = validateProduct(request.body);
     let saved;
     if (dataSource === 'mongodb') { const existing = await Product.findById(request.params.id); if (existing) saved = await Product.findByIdAndUpdate(existing.id, preserveReservedStock(existing, updated), { new: true, runValidators: true }); }
-    else { const index = demoProductStore.findIndex((item) => item.id === request.params.id || item.sku === request.params.id); if (index < 0) return response.status(404).json({ error: 'Product not found.' }); saved = { ...demoProductStore[index], ...preserveReservedStock(demoProductStore[index], updated) }; demoProductStore[index] = saved; }
+    else { const index = demoProductStore.findIndex((item) => item.id === request.params.id); if (index < 0) return response.status(404).json({ error: 'Product not found.' }); saved = { ...demoProductStore[index], ...preserveReservedStock(demoProductStore[index], updated) }; demoProductStore[index] = saved; }
     if (!saved) return response.status(404).json({ error: 'Product not found.' });
     await invalidateSearchCache(); return response.json({ product: normalizeProduct(saved) });
   } catch (error) { return next(error); }
@@ -1380,7 +1384,7 @@ app.delete('/api/products/:id', requireAuth, requireManager, async (request, res
       if (await Order.exists({ 'items.productId': product._id, status: { $in: ['ready_to_pack', 'accepted', 'packing'] } })) return response.status(409).json({ error: 'This product is part of an open order. Complete or cancel that order before deleting it.' });
       deleted = await Product.findByIdAndDelete(request.params.id);
     } else {
-      const index = demoProductStore.findIndex((product) => product.id === request.params.id || product.sku === request.params.id);
+      const index = demoProductStore.findIndex((product) => product.id === request.params.id);
       if (index < 0) return response.status(404).json({ error: 'Product not found.' });
       if (demoProductStore[index].locations.some((location) => Number(location.reserved || 0) > 0)) return response.status(409).json({ error: 'This product has units reserved for open orders. Complete or cancel those orders before deleting it.' });
       if (demoOrders.some((order) => ['ready_to_pack', 'accepted', 'packing'].includes(order.status) && order.items.some((item) => item.sku === demoProductStore[index].sku))) return response.status(409).json({ error: 'This product is part of an open order. Complete or cancel that order before deleting it.' });
@@ -1404,6 +1408,8 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
     for (let index = 0; index < rows.length; index += 1) {
       try {
         const product = validateProduct(rows[index]);
+        const id = String(rows[index]?.id || '').trim();
+        if (id && !mongoose.isValidObjectId(id)) throw Object.assign(new Error('Product ID is invalid. Re-export the warehouse CSV to get the current ID.'), { status: 400 });
         if (!product.locations.length) throw Object.assign(new Error('This SKU has no valid stock quantity row. Fix the qty column before importing.'), { status: 400 });
         const warehouseLocations = product.locations.filter((location) => location.rack !== 'BACKORDER').map((location) => ({ ...location, warehouse }));
         const byRack = new Map();
@@ -1414,17 +1420,41 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
           else byRack.set(key, { ...location });
         }
         const selectedLocations = [...byRack.values()];
-        prepared.push({ index, product, selectedLocations });
+        prepared.push({ index, id, product, selectedLocations });
       } catch (error) { errors.push({ row: index + 2, sku: rows[index]?.sku || '', error: error.message }); }
     }
-    const existingProducts = prepared.length ? await Product.find({ sku: { $in: prepared.map(({ product }) => product.sku) } }).lean() : [];
+    const ids = prepared.map(({ id }) => id).filter(Boolean);
+    const skus = prepared.map(({ product }) => product.sku);
+    const existingProducts = prepared.length ? await Product.find({ $or: [...(ids.length ? [{ _id: { $in: ids } }] : []), { sku: { $in: skus } }] }).lean() : [];
+    const existingById = new Map(existingProducts.map((product) => [String(product._id), product]));
     const existingBySku = new Map(existingProducts.map((product) => [product.sku, product]));
     const operations = [];
-    for (const { index, product, selectedLocations } of prepared) {
-      const existing = existingBySku.get(product.sku);
-      if (!existing) {
+    const claimedSkus = new Set();
+    for (const { index, id, product, selectedLocations } of prepared) {
+      if (claimedSkus.has(product.sku)) {
+        errors.push({ row: index + 2, sku: product.sku, error: 'This file contains more than one product with the same SKU.' });
+        continue;
+      }
+      claimedSkus.add(product.sku);
+      const existing = id ? existingById.get(id) : null;
+      if (id && !existing) {
         if (updateMatchingOnly) { skipped += 1; continue; }
+        errors.push({ row: index + 2, sku: product.sku, error: `Product ID ${id} was not found. IDs are never created or changed by imports.` });
+        continue;
+      }
+      if (!existing) {
+        const sameSku = existingBySku.get(product.sku);
+        if (sameSku) {
+          if (updateMatchingOnly) { skipped += 1; continue; }
+          errors.push({ row: index + 2, sku: product.sku, error: `This SKU already belongs to product ID ${sameSku._id}. Re-export the warehouse and include the ID column to update it.` });
+          continue;
+        }
         operations.push({ insertOne: { document: { ...product, locations: selectedLocations } } });
+        continue;
+      }
+      const skuOwner = existingBySku.get(product.sku);
+      if (skuOwner && String(skuOwner._id) !== id) {
+        errors.push({ row: index + 2, sku: product.sku, error: `This SKU already belongs to another product (ID ${skuOwner._id}).` });
         continue;
       }
       const retained = (existing.locations || []).filter((location) => location.warehouse !== warehouse || location.rack === 'BACKORDER');
@@ -1444,19 +1474,18 @@ app.post('/api/products/import', requireAuth, requireManager, async (request, re
       })];
       const fields = new Set(rows[index]?.providedFields || []);
       const productUpdates = {};
-      if (updateMatchingOnly) {
-        if (fields.has('name')) productUpdates.name = product.name;
-        if (fields.has('brand')) productUpdates.brand = product.brand;
-        if (fields.has('category')) productUpdates.category = product.category;
-        if (fields.has('unit') || fields.has('uom')) productUpdates.unit = product.unit;
-        if (fields.has('oe')) productUpdates.oe = product.oe;
-        if (fields.has('barcode')) productUpdates.barcode = product.barcode;
-        if (fields.has('price')) productUpdates.price = product.price;
-        if (fields.has('priceincludesgst')) productUpdates.priceIncludesGst = product.priceIncludesGst;
-        if (fields.has('cost')) productUpdates.cost = product.cost;
-        if (fields.has('reorderpoint')) productUpdates.reorderPoint = product.reorderPoint;
-        if (['fitments', 'vehiclemake', 'vehiclemodel', 'yearfrom', 'yearto', 'engine'].some((field) => fields.has(field))) productUpdates.vehicleFitment = product.vehicleFitment;
-      }
+      if (fields.has('sku')) productUpdates.sku = product.sku;
+      if (fields.has('name')) productUpdates.name = product.name;
+      if (fields.has('brand')) productUpdates.brand = product.brand;
+      if (fields.has('category')) productUpdates.category = product.category;
+      if (fields.has('unit') || fields.has('uom')) productUpdates.unit = product.unit;
+      if (fields.has('oe')) productUpdates.oe = product.oe;
+      if (fields.has('barcode')) productUpdates.barcode = product.barcode;
+      if (fields.has('price')) productUpdates.price = product.price;
+      if (fields.has('priceincludesgst')) productUpdates.priceIncludesGst = product.priceIncludesGst;
+      if (fields.has('cost')) productUpdates.cost = product.cost;
+      if (fields.has('reorderpoint')) productUpdates.reorderPoint = product.reorderPoint;
+      if (['fitments', 'vehiclemake', 'vehiclemodel', 'yearfrom', 'yearto', 'engine'].some((field) => fields.has(field))) productUpdates.vehicleFitment = product.vehicleFitment;
       operations.push({ updateOne: { filter: { _id: existing._id, locations: existing.locations }, update: { $set: { locations: mergedLocations, ...productUpdates } } } });
     }
     if (operations.length) {
@@ -1479,7 +1508,7 @@ app.get('/api/products/export', requireAuth, requireManager, async (request, res
     if (filterBy && !['category', 'brand', 'oe'].includes(filterBy)) return response.status(400).json({ error: 'Choose category, brand, or OE number as the export filter.' });
     if (filterBy && !filterValue) return response.status(400).json({ error: 'Enter an exact value for the selected export filter.' });
     if (!filterBy && filterValue) return response.status(400).json({ error: 'Choose a filter type for the export value.' });
-    const columns = ['sku', 'name', 'brand', 'category', 'unit', 'oe', 'barcode', 'price', 'priceIncludesGst', 'cost', 'reorderPoint', 'warehouse', 'rack', 'qty', 'vehicleMake', 'vehicleModel', 'yearFrom', 'yearTo', 'engine', 'fitments'];
+    const columns = ['id', 'sku', 'name', 'brand', 'category', 'unit', 'oe', 'barcode', 'price', 'priceIncludesGst', 'cost', 'reorderPoint', 'warehouse', 'rack', 'qty', 'vehicleMake', 'vehicleModel', 'yearFrom', 'yearTo', 'engine', 'fitments'];
     const escapeCsv = (value) => `"${String(value ?? '').replaceAll('"', '""')}"`;
     const filenameValue = filterValue.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
     const filename = `saraswati-${warehouse.toLowerCase()}-${filterBy ? `${filterBy}-${filenameValue}` : 'inventory'}.csv`;
@@ -1500,21 +1529,21 @@ app.get('/api/products/export', requireAuth, requireManager, async (request, res
       if (filterBy === 'category' || filterBy === 'brand') filter[filterBy] = { $regex: `^${escapeRegex(filterValue)}$`, $options: 'i' };
       if (filterBy === 'oe') filter.oe = { $regex: `^${escapeRegex(filterValue)}$`, $options: 'i' };
       const cursor = Product.find(filter)
-        .select('sku name brand category unit oe barcode price priceIncludesGst cost reorderPoint vehicleFitment locations')
+        .select('_id sku name brand category unit oe barcode price priceIncludesGst cost reorderPoint vehicleFitment locations')
         .sort({ sku: 1 }).lean().cursor({ batchSize: 250 });
       for await (const product of cursor) {
         if (!matchesFilter(product)) continue;
         for (const location of product.locations || []) {
           if (location.warehouse !== warehouse) continue;
           const fitment = product.vehicleFitment?.[0] || {};
-          await writeRow([product.sku, product.name, product.brand, product.category, product.unit || 'PCS', (product.oe || []).join('|'), product.barcode, product.price, product.priceIncludesGst, product.cost, product.reorderPoint, warehouse, location.rack, location.qty, fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine, JSON.stringify(product.vehicleFitment || [])]);
+          await writeRow([String(product._id), product.sku, product.name, product.brand, product.category, product.unit || 'PCS', (product.oe || []).join('|'), product.barcode, product.price, product.priceIncludesGst, product.cost, product.reorderPoint, warehouse, location.rack, location.qty, fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine, JSON.stringify(product.vehicleFitment || [])]);
         }
       }
     } else {
       for (const product of demoProductStore) for (const location of product.locations || []) {
         if (location.warehouse !== warehouse || !matchesFilter(product)) continue;
         const fitment = product.vehicleFitment?.[0] || {};
-        await writeRow([product.sku, product.name, product.brand, product.category, product.unit || 'PCS', (product.oe || []).join('|'), product.barcode, product.price, product.priceIncludesGst, product.cost, product.reorderPoint, warehouse, location.rack, location.qty, fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine, JSON.stringify(product.vehicleFitment || [])]);
+        await writeRow([String(product.id), product.sku, product.name, product.brand, product.category, product.unit || 'PCS', (product.oe || []).join('|'), product.barcode, product.price, product.priceIncludesGst, product.cost, product.reorderPoint, warehouse, location.rack, location.qty, fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine, JSON.stringify(product.vehicleFitment || [])]);
       }
     }
     return response.end();
@@ -1648,7 +1677,7 @@ app.post('/api/orders', requireAuth, requireManager, async (request, response, n
       const gstIncluded = Boolean(product.priceIncludesGst);
       const lineTotal = money(unitPrice * quantity);
       const taxableAmount = money(gstIncluded ? lineTotal / (1 + gstRate / 100) : lineTotal);
-    orderItems.push({ productId: dataSource === 'mongodb' ? product._id : product.id, sku: product.sku, name: product.name, brand: product.brand, unit: product.unit || 'PCS', quantity, unitPrice, lineTotal, taxableAmount, gstIncluded, gstRate, gstAmount: money(gstIncluded ? lineTotal - taxableAmount : taxableAmount * gstRate / 100), allocations: [] });
+    orderItems.push({ productId: dataSource === 'mongodb' ? product._id : product.id, sku: product.sku, name: productLabel(product), brand: product.brand, unit: product.unit || 'PCS', quantity, unitPrice, lineTotal, taxableAmount, gstIncluded, gstRate, gstAmount: money(gstIncluded ? lineTotal - taxableAmount : taxableAmount * gstRate / 100), allocations: [] });
     }
     const subtotal = money(orderItems.reduce((sum, item) => sum + item.taxableAmount, 0)); const discountAmount = money(Math.min(subtotal, Math.max(0, Number(request.body.discountAmount || 0))));
     const taxAmount = money((subtotal - discountAmount) * taxRate / 100);

@@ -23,26 +23,30 @@ export function parseProductCsv(source) {
   const headers = rows[0].map((header) => header.trim().toLowerCase().replaceAll(' ', ''));
   const index = (key) => headers.indexOf(key);
   const value = (row, key) => { const position = index(key); return position < 0 ? '' : String(row[position] || '').trim(); };
-  if (index('sku') < 0 || index('name') < 0 || index('brand') < 0) throw new Error('CSV must include sku, name and brand columns.');
+  if (index('sku') < 0 || index('brand') < 0) throw new Error('CSV must include sku and brand columns.');
   const grouped = new Map();
   rows.slice(1).forEach((row, rowIndex) => {
     const sku = value(row, 'sku').toUpperCase();
     if (!sku) return;
+    const id = value(row, 'id') || value(row, 'productid');
+    const groupKey = id ? `id:${id}` : `sku:${sku}`;
     let rowFitments = [];
     try { const parsed = JSON.parse(value(row, 'fitments')); if (Array.isArray(parsed)) rowFitments = parsed; } catch { /* fall back to the single fitment columns */ }
     if (!rowFitments.length) {
       const fitment = { make: value(row, 'vehiclemake'), model: value(row, 'vehiclemodel'), yearFrom: Number(value(row, 'yearfrom')) || undefined, yearTo: Number(value(row, 'yearto')) || undefined, engine: value(row, 'engine') };
       if (fitment.make || fitment.model) rowFitments = [fitment];
     }
-    let product = grouped.get(sku);
+    let product = grouped.get(groupKey);
     if (!product) {
       product = {
-        sku, name: value(row, 'name'), brand: value(row, 'brand'), category: value(row, 'category') || 'General', unit: (value(row, 'unit') || value(row, 'uom') || 'PCS').toUpperCase(),
+        ...(id ? { id } : {}), sku, name: value(row, 'name'), brand: value(row, 'brand'), category: value(row, 'category') || 'General', unit: (value(row, 'unit') || value(row, 'uom') || 'PCS').toUpperCase(),
         oe: value(row, 'oe').split(/[|;]/).map((item) => item.trim()).filter(Boolean), barcode: value(row, 'barcode'),
         price: Number(value(row, 'price')) || 0, priceIncludesGst: ['true', 'yes', '1'].includes(value(row, 'priceincludesgst').toLowerCase()), cost: Number(value(row, 'cost')) || 0, reorderPoint: Number(value(row, 'reorderpoint')) || 0,
         vehicleFitment: [], locations: [], row: rowIndex + 2, providedFields: headers,
       };
-      grouped.set(sku, product);
+      grouped.set(groupKey, product);
+    } else if (product.sku !== sku || product.brand !== value(row, 'brand')) {
+      throw new Error(`Rows for product ID ${id || sku} contain conflicting SKU or brand values.`);
     }
     for (const fitment of rowFitments) {
       const key = JSON.stringify([fitment.make, fitment.model, fitment.yearFrom, fitment.yearTo, fitment.engine]);

@@ -9,6 +9,7 @@
     "dev:full": "concurrently -k -n api,web -c green,blue \"npm:dev:api\" \"vite --host 0.0.0.0\"",
     "start": "node server/index.js",
     "seed:demo": "node server/seed.js",
+    "migrate:categories": "node server/migrations/backfill-product-categories.js",
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview"

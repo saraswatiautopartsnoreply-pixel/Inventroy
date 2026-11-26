@@ -8,7 +8,7 @@ const locationSchema = new mongoose.Schema({
 }, { _id: false });
 
 const productSchema = new mongoose.Schema({
-  name: { type: String, required: true, trim: true, maxlength: 160 },
+  name: { type: String, trim: true, maxlength: 160, default: '' },
   sku: { type: String, required: true, unique: true, trim: true, uppercase: true, maxlength: 80 },
   brand: { type: String, required: true, trim: true, maxlength: 100 },
   category: { type: String, trim: true, maxlength: 100, default: 'General' },
