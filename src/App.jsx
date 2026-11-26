@@ -28,6 +28,7 @@ const ROLE_PERMISSIONS = {
 };
 const PRODUCT_PAGE_SIZE = 25;
 const normalizeSearchValue = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+const productDisplayName = (product) => product?.brand && product?.sku ? `${product.brand} ${product.sku}` : product?.name || product?.sku || product?.brand || 'Unnamed product';
 const fmt = (value) => `₹${Number(value || 0).toLocaleString('en-IN')}`;
 const GST_RATE = 18;
 const roundMoney = (amount) => Math.round((Number(amount || 0) + Number.EPSILON) * 100) / 100;
@@ -104,16 +105,16 @@ function ProductForm({ product, racks, onClose, onSave }) {
 }
 
 function AlternativesModal({ product, products, onClose, onSell, canSell, allowZeroStockSales }) {
-  const alternatives = products.filter((item) => item.id !== product.id && item.oe.some((number) => product.oe.includes(number)));
+  const alternatives = [...new Map([product, ...products.filter((item) => item.id !== product.id && item.oe.some((number) => product.oe.includes(number)))].map((item) => [item.id, item])).values()];
   return <Modal title="OE number alternatives" onClose={onClose} wide>
-    <div className="oe-modal-intro"><div className="oe-symbol"><Link2 size={19} /></div><div><strong>{product.name}</strong><p>Matching OE number{product.oe.length === 1 ? '' : 's'}: {product.oe.join(' · ') || 'None added'}</p></div></div>
+    <div className="oe-modal-intro"><div className="oe-symbol"><Link2 size={19} /></div><div><strong>{productDisplayName(product)}</strong><p>Matching OE number{product.oe.length === 1 ? '' : 's'}: {product.oe.join(' · ') || 'None added'}</p></div></div>
     <div className="alternatives-list">{alternatives.length ? <>
-      <div className="alternative-heading" aria-hidden="true"><span>Alternative part</span><span>Available</span><span>Price</span><span>Action</span></div>
+      <div className="alternative-heading" aria-hidden="true"><span>Part</span><span>Available</span><span>Price</span><span>Action</span></div>
       {alternatives.map((alt) => {
       const stock = availableFor(alt);
       const stockLocations = alt.locations.filter((location) => Number(location.qty || 0) - Number(location.reserved || 0) > 0);
       return <div className="alternative-row" key={alt.id}>
-        <div className="alternative-main"><strong>{alt.name}</strong><span>{alt.brand} <i>·</i> {alt.sku}</span></div>
+        <div className="alternative-main"><strong>{productDisplayName(alt)}</strong><span>{alt.brand} <i>·</i> {alt.sku}</span></div>
         <div className="alternative-stock"><strong className={stock ? 'stock-good' : 'stock-zero'}>{stock} {alt.unit || 'PCS'}</strong><span>{stockLocations.map((location) => `${location.warehouse || 'Unassigned'}${location.rack ? ` · ${location.rack}` : ''}`).join(', ') || 'No available stock'}</span></div>
         <div className="alternative-price">{fmt(alt.price)}<small>{alt.priceIncludesGst ? 'GST included' : 'plus 18% GST'}</small></div>
         {canSell && <div className="alternative-actions"><button className={`button ${stock || allowZeroStockSales ? 'button-primary' : 'button-quiet'}`} disabled={!stock && !allowZeroStockSales} onClick={() => { onSell(alt); onClose(); }} title={stock ? `Sell ${alt.name}` : allowZeroStockSales ? 'Create a backorder sale' : 'No available stock'}><ShoppingCart size={14} />{stock ? 'Sell' : allowZeroStockSales ? 'Backorder' : 'Out of stock'}</button></div>}
@@ -367,13 +368,14 @@ function App() {
   };
   const localQueryProducts = products.filter((p) => {
     const searchTerm = normalizeSearchValue(query);
+    if (query.trim().length < 2) return true;
     const fields = [p.name, p.sku, p.brand, ...(p.oe || []), p.barcode, p.category, ...(p.vehicleFitment || []).flatMap((fitment) => [fitment.make, fitment.model, fitment.engine])];
     return !query.trim() || (searchTerm
       ? fields.some((value) => normalizeSearchValue(value).includes(searchTerm))
       : fields.some((value) => String(value || '').toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())));
   });
   const searchProducts = query.trim().length < 2 || searchError || !searchResponse
-    ? localQueryProducts
+    ? query.trim().length >= 2 && !searchError && !searchResponse ? [] : localQueryProducts
     : searchResponse.source === 'demo'
       ? [...new Map([...searchResponse.items, ...localQueryProducts].map((item) => [item.sku, item])).values()]
       : searchResponse.items;
@@ -389,7 +391,10 @@ function App() {
     if (!product?.sku) return;
     const parameters = new URLSearchParams({ q: product.sku, warehouse: 'all', page: '1' });
     api(`/products/search?${parameters}`).then((result) => {
-      if (result.items?.length) setAltProduct((current) => current?.product.id === product.id ? { ...current, products: result.items } : current);
+      if (result.items?.length) {
+        const completeGroup = [...new Map([product, ...result.items].map((item) => [item.id, item])).values()];
+        setAltProduct((current) => current?.product.id === product.id ? { ...current, products: completeGroup } : current);
+      }
     }).catch(() => {});
   };
   const navClick = (name) => { if (currentUser?.role === 'Packer' && !['Orders', 'Packing'].includes(name)) return; setPage(name); setMenuOpen(false); setQuery(''); };
@@ -546,13 +551,14 @@ function App() {
         {page === 'Inventory' && <>
           <section className="page-heading"><div><h1>Inventory</h1><p>Track parts across every warehouse.</p></div>{canEdit && <button className="button button-primary" onClick={addNewProduct}><Plus size={17} /> Add product</button>}</section>
           <section className="inventory-filters" aria-label="Inventory filters">
-            <div className="inventory-filter-controls"><label className="inventory-filter-search"><Search size={17} /><input ref={searchInputRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search name, part no., OE no. or brand" /></label><label className="inventory-filter-select"><MapPin size={16} /><select value={warehouseFilter} onChange={(e) => setWarehouseFilter(e.target.value)}><option value="all">All warehouses</option>{warehouses.map((w) => <option key={w.code} value={w.code}>{w.code} · {w.name}</option>)}</select><ChevronDown size={15} /></label><label className="inventory-filter-select"><select value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}><option value="all">All categories</option>{productCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select><ChevronDown size={15} /></label><span className="inventory-filter-count">{productTotal.toLocaleString('en-IN')} parts</span></div>
+            <div className="inventory-filter-controls"><label className="inventory-filter-search"><Search size={17} /><input ref={searchInputRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search name, part no., OE no. or brand" /></label><label className="inventory-filter-select"><MapPin size={16} /><select value={warehouseFilter} onChange={(e) => setWarehouseFilter(e.target.value)}><option value="all">All warehouses</option>{warehouses.map((w) => <option key={w.code} value={w.code}>{w.code} · {w.name}</option>)}</select><ChevronDown size={15} /></label><label className="inventory-filter-select"><select value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}><option value="all">All categories</option>{productCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select><ChevronDown size={15} /></label><span className="inventory-filter-count">{query.trim().length === 1 ? `${filteredProducts.length} products on this page` : `${productTotal.toLocaleString('en-IN')} parts`}</span></div>
             <div className="inventory-filter-tabs" role="tablist" aria-label="Filter by stock status">{[['all', 'All'], ['in', 'In stock'], ['low', 'Low stock'], ['out', 'Out of stock']].map(([value, label]) => <button key={value} type="button" role="tab" aria-selected={stockFilter === value} className={stockFilter === value ? 'active' : ''} onClick={() => setStockFilter(value)}>{label}</button>)}</div>
           </section>
           {searchPending && <p className="search-feedback" role="status">Searching products…</p>}
+          {!searchPending && query.trim().length === 1 && <p className="search-feedback" role="status">Enter at least 2 characters to search the full catalog.</p>}
           {!searchPending && searchError && <p className="search-feedback search-fallback" role="status">{searchError}</p>}
           {!searchPending && searchResponse && query.trim().length >= 2 && <p className="search-feedback" role="status">{searchResponse.total} match{searchResponse.total === 1 ? '' : 'es'} · {searchResponse.source === 'mongodb' ? 'MongoDB' : 'demo search'}{searchResponse.cached ? ' · Redis cache' : ''}</p>}
-          <InventoryTable products={filteredProducts} allProducts={searchProducts} warehouseFilter={warehouseFilter} canEdit={canEdit} allowZeroStockSales={systemSettings.allowZeroStockSales} page={productPage} pageSize={PRODUCT_PAGE_SIZE} total={query.trim().length >= 2 && searchResponse ? searchResponse.total : productTotal} onPageChange={setProductPage} searching={query.trim().length >= 2} onEdit={openEdit} onAlternatives={showAlternatives} onSell={openQuickSell} onDelete={deleteProduct} />
+          <InventoryTable products={filteredProducts} allProducts={searchProducts} warehouseFilter={warehouseFilter} canEdit={canEdit} allowZeroStockSales={systemSettings.allowZeroStockSales} page={productPage} pageSize={PRODUCT_PAGE_SIZE} total={query.trim().length >= 2 ? (searchError ? filteredProducts.length : (searchResponse?.total || 0)) : productTotal} loading={searchPending} localSearch={Boolean(searchError)} searching={query.trim().length >= 2} onPageChange={setProductPage} onEdit={openEdit} onAlternatives={showAlternatives} onSell={openQuickSell} onDelete={deleteProduct} />
         </>}
         {page === 'Overview' && <Overview products={products} totalSkus={productTotal} productSummary={productSummary} activity={activity} orders={orders} report={salesReport} totalUnits={totalUnits} lowStock={lowStock} canEdit={canEdit} allowZeroStockSales={systemSettings.allowZeroStockSales} onInventory={() => navClick('Inventory')} onImport={() => navClick('Import / export')} onAddProduct={addNewProduct} onSell={openQuickSell} onPacking={() => navClick('Packing')} onActivity={() => navClick('Activity')} onSalesHistory={() => navClick('Sales history')} onOpenProduct={(product) => { setQuery(product.sku); setPage('Inventory'); }} />}
         {page === 'OE mapping' && <OEMapping onAlternatives={showAlternatives} onSearch={(oe) => { setQuery(oe); setPage('Inventory'); }} />}
@@ -584,7 +590,7 @@ function App() {
   </div>;
 }
 
-function InventoryTable({ products, allProducts, warehouseFilter, canEdit, allowZeroStockSales, page, pageSize, total, onPageChange, searching, onEdit, onAlternatives, onSell, onDelete }) {
+function InventoryTable({ products, allProducts, warehouseFilter, canEdit, allowZeroStockSales, page, pageSize, total, loading, localSearch, onPageChange, searching, onEdit, onAlternatives, onSell, onDelete }) {
   const [contextMenu, setContextMenu] = useState(null);
   useEffect(() => {
     if (!contextMenu) return undefined;
@@ -592,17 +598,23 @@ function InventoryTable({ products, allProducts, warehouseFilter, canEdit, allow
     window.addEventListener('click', close); window.addEventListener('keydown', close);
     return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', close); };
   }, [contextMenu]);
+  const openContextMenu = (event, product) => {
+    if (!canEdit) return;
+    event.preventDefault();
+    const width = 184; const height = 90; const gap = 10;
+    const x = event.clientX + width + gap <= window.innerWidth ? event.clientX + gap : Math.max(8, event.clientX - width - gap);
+    const y = event.clientY + height + gap <= window.innerHeight ? event.clientY + gap : Math.max(8, event.clientY - height - gap);
+    setContextMenu({ product, x, y });
+  };
   return <section className="table-region"><div className="table-scroll"><table className="inventory-table"><colgroup><col className="inventory-col-product" /><col className="inventory-col-sku" /><col className="inventory-col-oe" /><col className="inventory-col-brand" /><col className="inventory-col-available" /><col className="inventory-col-location" /><col className="inventory-col-actions" /></colgroup><thead><tr><th>Product</th><th>SKU</th><th>OE</th><th>Brand</th><th>Qty</th><th>Location</th><th>Action</th></tr></thead><tbody>{products.map((product) => {
     const qty = product.locations.filter((location) => warehouseFilter === 'all' || location.warehouse === warehouseFilter).reduce((sum, location) => sum + Number(location.qty || 0) - Number(location.reserved || 0), 0);
-    const displayName = product.brand && product.sku ? product.brand + ' + ' + product.sku : product.name || product.sku || product.brand || 'Unnamed product';
-    const alternatives = allProducts.filter((item) => item.id !== product.id && item.oe.some((oe) => product.oe.includes(oe)));
-    return <tr key={product.id} onContextMenu={(event) => { if (!canEdit) return; event.preventDefault(); setContextMenu({ product, x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 115) }); }}>
-      <td className="product-cell"><button className="product-name" onClick={() => onAlternatives(product, allProducts)} onContextMenu={(event) => { if (!canEdit) return; event.preventDefault(); setContextMenu({ product, x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 115) }); }} title={canEdit ? 'Click to view OE alternatives ? right-click to edit or delete' : 'View OE alternatives'}>{displayName}</button>{alternatives.length > 0 && <button className="alt-link" onClick={() => onAlternatives(product, allProducts)}>{alternatives.length} alternatives <ChevronRight size={13} /></button>}</td>
-      <td className="mono sku-cell" title={product.sku}>{product.sku || '?'}</td><td className="mono oe-value" title={product.oe.join(', ')}>{product.oe.join(', ') || '?'}</td><td className="brand-cell" title={product.brand}>{product.brand || '?'}</td><td><span className={'quantity ' + (qty < 0 ? 'qty-backorder' : qty === 0 ? 'qty-zero' : qty <= Number(product.reorderPoint || 5) ? 'qty-low' : 'qty-good')}>{qty} {product.unit || 'PCS'}</span>{qty < 0 && <span className="low-note">Backorder</span>}{qty > 0 && qty <= Number(product.reorderPoint || 5) && <span className="low-note">Low stock</span>}</td><td className="location-cell">{product.locations.filter((loc) => warehouseFilter === 'all' || loc.warehouse === warehouseFilter).map((loc) => <span key={loc.warehouse + '-' + loc.rack}>{loc.warehouse ? <><b>{loc.warehouse}</b>{loc.rack && <> ? {loc.rack === 'BACKORDER' ? 'Backorder' : loc.rack}</>}</> : loc.rack}</span>)}</td><td className="inventory-actions">{canEdit && <button className="row-action sell-action" disabled={qty <= 0 && !allowZeroStockSales} onClick={() => onSell(product)} title={qty <= 0 && !allowZeroStockSales ? 'Zero-stock sales are disabled in System settings' : 'Sell ' + displayName}><ShoppingCart size={15} /><span>Sell</span></button>}</td>
+    const displayName = productDisplayName(product);
+    return <tr key={product.id} className="inventory-product-row" onClick={() => onAlternatives(product, allProducts)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onAlternatives(product, allProducts); } }} onContextMenu={(event) => openContextMenu(event, product)}>
+      <td className="product-cell"><button className="product-name" onClick={(event) => { event.stopPropagation(); onAlternatives(product, allProducts); }} title="View OE alternatives">{displayName}</button></td>
+      <td className="mono sku-cell" title={product.sku}>{product.sku || '—'}</td><td className="mono oe-value" title={product.oe.join(', ')}>{product.oe.join(', ') || '—'}</td><td className="brand-cell" title={product.brand}>{product.brand || '—'}</td><td><span className={'quantity ' + (qty < 0 ? 'qty-backorder' : qty === 0 ? 'qty-zero' : qty <= Number(product.reorderPoint || 5) ? 'qty-low' : 'qty-good')}>{qty} {product.unit || 'PCS'}</span>{qty < 0 && <span className="low-note">Backorder</span>}{qty > 0 && qty <= Number(product.reorderPoint || 5) && <span className="low-note">Low stock</span>}</td><td className="location-cell">{product.locations.filter((loc) => warehouseFilter === 'all' || loc.warehouse === warehouseFilter).map((loc) => <span key={loc.warehouse + '-' + loc.rack}>{loc.warehouse ? <><b>{loc.warehouse}</b>{loc.rack && <> · {loc.rack === 'BACKORDER' ? 'Backorder' : loc.rack}</>}</> : loc.rack}</span>)}</td><td className="inventory-actions">{canEdit && <button className="row-action sell-action" disabled={qty <= 0 && !allowZeroStockSales} onClick={(event) => { event.stopPropagation(); onSell(product); }} title={qty <= 0 && !allowZeroStockSales ? 'Zero-stock sales are disabled in System settings' : 'Sell ' + displayName}><ShoppingCart size={15} /><span>Sell</span></button>}</td>
     </tr>;
-  })}{!products.length && <tr><td className="no-results" colSpan="7"><Search size={20} /><strong>No matching products</strong><span>Try a different SKU, OE number, barcode or warehouse filter.</span></td></tr>}</tbody></table></div><footer className="table-footer"><span>Showing <strong>{total ? ((page - 1) * pageSize + 1).toLocaleString('en-IN') + ' to ' + Math.min(page * pageSize, total).toLocaleString('en-IN') : '0'}</strong> of <strong>{total.toLocaleString('en-IN')}</strong> products{searching ? ' matching search' : ''}</span><div className="pagination"><button className="page-arrow" disabled={page <= 1} aria-label="Previous page" onClick={() => onPageChange((value) => Math.max(1, value - 1))}><ChevronLeft size={17} /></button><button className="page-current">{page}</button><button className="page-arrow" disabled={page * pageSize >= total} aria-label="Next page" onClick={() => onPageChange((value) => value + 1)}><ChevronRight size={17} /></button></div></footer>{contextMenu && <div className="inventory-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onClick={(event) => event.stopPropagation()}><button role="menuitem" onClick={() => { const product = contextMenu.product; setContextMenu(null); onEdit(product); }}><FileSpreadsheet size={15} /> Edit product</button><button role="menuitem" className="context-delete" onClick={() => { const product = contextMenu.product; setContextMenu(null); onDelete(product); }}><Trash2 size={15} /> Delete product</button></div>}</section>;
+  })}{!products.length && <tr><td className="no-results" colSpan="7">{loading ? <><strong>Searching products…</strong><span>Please wait for matching products.</span></> : <><Search size={20} /><strong>No matching products</strong><span>Try a different SKU, OE number, barcode or warehouse filter.</span></>}</td></tr>}</tbody></table></div><footer className="table-footer"><span>{localSearch ? 'Showing matches from this page; full catalog search is temporarily unavailable.' : <>Showing <strong>{total ? ((page - 1) * pageSize + 1).toLocaleString('en-IN') + ' to ' + Math.min(page * pageSize, total).toLocaleString('en-IN') : '0'}</strong> of <strong>{total.toLocaleString('en-IN')}</strong> products{searching ? ' matching search' : ''}</>}</span><div className="pagination"><button className="page-arrow" disabled={page <= 1 || localSearch || loading} aria-label="Previous page" onClick={() => onPageChange((value) => Math.max(1, value - 1))}><ChevronLeft size={17} /></button><button className="page-current">{page}</button><button className="page-arrow" disabled={page * pageSize >= total || localSearch || loading} aria-label="Next page" onClick={() => onPageChange((value) => value + 1)}><ChevronRight size={17} /></button></div></footer>{contextMenu && <div className="inventory-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onClick={(event) => event.stopPropagation()}><button role="menuitem" onClick={() => { const product = contextMenu.product; setContextMenu(null); onEdit(product); }}><FileSpreadsheet size={15} /> Edit product</button><button role="menuitem" className="context-delete" onClick={() => { const product = contextMenu.product; setContextMenu(null); onDelete(product); }}><Trash2 size={15} /> Delete product</button></div>}</section>;
 }
-
 function Overview({ products, totalSkus, productSummary, activity, orders, report, totalUnits, lowStock, canEdit, allowZeroStockSales, onInventory, onImport, onAddProduct, onSell, onPacking, onActivity, onSalesHistory, onOpenProduct }) {
   const [warehouse, setWarehouse] = useState('all');
   const low = products.filter((product) => (warehouse === 'all' || product.locations.some((location) => location.warehouse === warehouse)) && availableFor(product, warehouse) <= Number(product.reorderPoint || 5))
