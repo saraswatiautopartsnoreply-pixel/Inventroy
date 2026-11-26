@@ -1,4 +1,4 @@
-# Saraswati Inventory System
+# Saraswati Inventory System (kaam 2 months ka hai trial m hai yh abhi)
 
 Saraswati Inventory System is a web inventory and sales workspace for automotive spare parts across KG (Kashmiri Gate), SPB (Samaypur Badli), BG (Bangalore), and PB (Palika Bazaar). It includes OE cross-reference, vehicle fitment, rack locations, barcode display, live AJAX product search, sales orders, packing, invoices, sales history, reports, CSV transfer, and optional WooCommerce sync.
 
@@ -40,6 +40,10 @@ CSV import accepts a header row containing `sku`, `name`, and `brand`. Optional 
 ## WooCommerce
 
 Set `WOOCOMMERCE_URL`, `WOOCOMMERCE_CONSUMER_KEY`, and `WOOCOMMERCE_CONSUMER_SECRET` in the API server environment. Use a WooCommerce REST API key with **Read** permissions for the current view-only integration; use HTTPS, and never put the keys in the frontend, chat, or a commit. The product browser displays images and YMM information exposed through WooCommerce product attributes or matching metadata. Product mapping uses SKU. Catalog and processing orders can be imported into Saraswati Inventory; imported orders are deduplicated by WooCommerce order ID.
+
+## Razorpay (bas ab or update nahi)
+
+set "Razorpay_SECRET_key" and "razorpay_consumer_key" in the API server environment. and a refresh button to check payment status In Razorpay, set the webhook URL to https://your-domain/api/webhooks/razorpay, use the same secret as RAZORPAY_WEBHOOK_SECRET in the server .env, and subscribe to payment_link.paid, payment_link.partially_paid, payment_link.cancelled, payment_link.expired, and payment.failed.
 
 ## Production deployment and safe updates
 
