@@ -40,7 +40,8 @@ const gstTotal = (amount, includesGst) => includesGst ? Number(amount || 0) : Nu
 const totalForWarehouse = (product, code) => product.locations.filter((loc) => loc.warehouse === code).reduce((sum, loc) => sum + Number(loc.qty || 0), 0);
 const availableFor = (product, code = 'all') => Math.max(0, product.locations.filter((loc) => code === 'all' || loc.warehouse === code).reduce((sum, loc) => sum + Number(loc.qty || 0) - Number(loc.reserved || 0), 0));
 async function api(path, options = {}) {
-  const headers = { Accept: 'application/json', ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) };
+  const isBinary = options.body instanceof Blob || options.body instanceof FormData || options.body instanceof ArrayBuffer;
+  const headers = { Accept: 'application/json', ...(options.body && !isBinary ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) };
   const response = await fetch(`/api${path}`, { credentials: 'same-origin', ...options, headers });
   if (response.status === 204) return null;
   const contentType = response.headers.get('content-type') || '';
@@ -789,10 +790,7 @@ function compressPhoto(file) {
         context.drawImage(image, 0, 0, canvas.width, canvas.height);
         const readBlob = (blob) => {
           if (!blob) return reject(new Error('Could not compress this photo. Try another image.'));
-          const output = new FileReader();
-          output.onerror = () => reject(new Error('Could not prepare the compressed photo for upload.'));
-          output.onload = () => resolve(String(output.result));
-          output.readAsDataURL(blob);
+          resolve(blob);
         };
         canvas.toBlob((webp) => {
           if (webp?.type === 'image/webp') return readBlob(webp);
@@ -814,7 +812,7 @@ function PackingPhotosModal({ order, user, onClose }) {
   useEffect(() => { refresh(); }, [order.id]);
   const upload = async (sku, file, slot) => {
     const workId = `${sku}-${slot}`; setWorking(workId); setError('');
-    try { const imageData = await compressPhoto(file); const result = await api(`/orders/${encodeURIComponent(order.id)}/photos`, { method: 'POST', body: JSON.stringify({ sku, imageData }) }); setPhotos((old) => [result.photo, ...old]); }
+    try { const media = file.type.startsWith('image/') ? await compressPhoto(file) : file; const result = await api(`/orders/${encodeURIComponent(order.id)}/photos`, { method: 'POST', body: media, headers: { 'Content-Type': media.type, 'X-Product-Sku': sku } }); setPhotos((old) => [result.photo, ...old]); }
     catch (failure) { setError(failure.message); }
     finally { setWorking(''); }
   };
@@ -824,16 +822,16 @@ function PackingPhotosModal({ order, user, onClose }) {
     {canUpload && <div className="photo-upload-products">{order.items.map((item) => {
       const productPhotos = photos.filter((photo) => photo.sku === item.sku);
       const slotCount = Math.max(6, Math.min(maxPhotosPerProduct, productPhotos.length));
-      return <section className="photo-product-slots" key={item.sku}><header><div><strong>{item.name}</strong><small>{item.sku} · {productPhotos.length}/{maxPhotosPerProduct} photos uploaded</small></div></header><div className="photo-slot-grid">{Array.from({ length: slotCount }, (_, index) => {
+      return <section className="photo-product-slots" key={item.sku}><header><div><strong>{item.name}</strong><small>{item.sku} · {productPhotos.length}/{maxPhotosPerProduct} media files uploaded</small></div></header><div className="photo-slot-grid">{Array.from({ length: slotCount }, (_, index) => {
         const savedPhoto = productPhotos[index]; const workId = `${item.sku}-${index}`;
         return savedPhoto
-          ? <div className="photo-slot photo-slot-filled" key={`${item.sku}-${index}`}><Check size={17} /><span>Photo {index + 1}</span><small>Uploaded</small></div>
-          : <label className="photo-slot" key={`${item.sku}-${index}`}><input type="file" accept="image/*" capture="environment" disabled={Boolean(working) || productPhotos.length >= maxPhotosPerProduct} onChange={(event) => { const file = event.target.files?.[0]; if (file) upload(item.sku, file, index); event.target.value = ''; }} /><Plus size={17} /><span>{working === workId ? 'Uploading…' : `Photo ${index + 1}`}</span><small>{working === workId ? 'Please wait' : 'Take photo'}</small></label>;
+          ? <div className="photo-slot photo-slot-filled" key={`${item.sku}-${index}`}><Check size={17} /><span>Media {index + 1}</span><small>Uploaded</small></div>
+          : <label className="photo-slot" key={`${item.sku}-${index}`}><input type="file" accept="image/*,video/mp4,video/webm,video/quicktime" capture="environment" disabled={Boolean(working) || productPhotos.length >= maxPhotosPerProduct} onChange={(event) => { const file = event.target.files?.[0]; if (file) upload(item.sku, file, index); event.target.value = ''; }} /><Plus size={17} /><span>{working === workId ? 'Uploading…' : `Photo or video ${index + 1}`}</span><small>{working === workId ? 'Please wait' : 'Capture or choose media'}</small></label>;
       })}</div></section>;
     })}</div>}
     {error && <p className="photo-feedback" role="status">{error}</p>}
-    {loading ? <p className="photo-feedback">Loading photos…</p> : photos.length ? <div className="packing-photo-grid">{photos.map((photo) => <article className="packing-photo-card" key={photo.id}><a href={photo.imageUrl} target="_blank" rel="noreferrer"><img src={photo.imageUrl} alt={`${photo.productName} packed by ${photo.packerName}`} loading="lazy" /></a><div className="packing-photo-details"><strong>{photo.productName}</strong><small>{photo.sku} · {photo.packerName}</small><small>{photo.keep ? 'Kept permanently' : `Auto-deletes ${new Date(photo.expiresAt).toLocaleDateString('en-IN')}`}</small>{canManage && <div className="photo-management-actions">{!photo.keep && <button className="text-button" disabled={Boolean(working)} onClick={() => keepProduct(photo)}>Keep all {photo.sku} photos</button>}<button className="text-button photo-delete" disabled={Boolean(working)} onClick={() => deletePhoto(photo)}>Delete photo</button></div>}</div></article>)}</div> : <div className="photo-empty"><PackageCheck size={24} /><strong>No packing photos yet</strong><span>{canUpload ? 'Use the six photo slots above to capture the packed product.' : 'Photos uploaded by the packer will appear here.'}</span></div>}
-  </div><footer className="modal-actions photo-modal-footer"><span className="helper-text">Up to 10 photos per product · photos delete after 7 days unless kept.</span><button className="button button-quiet" onClick={onClose}>Done</button></footer></Modal>;
+    {loading ? <p className="photo-feedback">Loading packing media…</p> : photos.length ? <div className="packing-photo-grid">{photos.map((photo) => <article className="packing-photo-card" key={photo.id}><a href={photo.imageUrl} target="_blank" rel="noreferrer">{photo.mediaType === 'video' ? <video src={photo.imageUrl} controls preload="metadata" aria-label={`${photo.productName} packing video`} /> : <img src={photo.imageUrl} alt={`${photo.productName} packed by ${photo.packerName}`} loading="lazy" />}</a><div className="packing-photo-details"><strong>{photo.productName}</strong><small>{photo.sku} · {photo.packerName} · {photo.mediaType === 'video' ? 'Video' : 'Photo'}</small><small>{photo.keep ? 'Kept permanently' : `Auto-deletes ${new Date(photo.expiresAt).toLocaleDateString('en-IN')}`}</small>{canManage && <div className="photo-management-actions">{!photo.keep && <button className="text-button" disabled={Boolean(working)} onClick={() => keepProduct(photo)}>Keep all {photo.sku} photos</button>}<button className="text-button photo-delete" disabled={Boolean(working)} onClick={() => deletePhoto(photo)}>Delete media</button></div>}</div></article>)}</div> : <div className="photo-empty"><PackageCheck size={24} /><strong>No packing media yet</strong><span>{canUpload ? 'Use the six media slots above to capture photos or video.' : 'Media uploaded by the packer will appear here.'}</span></div>}
+  </div><footer className="modal-actions photo-modal-footer"><span className="helper-text">Up to 10 photos or videos per product · media delete after 7 days unless kept. Videos up to 30 MB.</span><button className="button button-quiet" onClick={onClose}>Done</button></footer></Modal>;
 }
 
 const STATUS_LABELS = { ready_to_pack: 'Ready to pack', accepted: 'Accepted', packing: 'Packing', packed: 'Packed', shipped: 'Shipped', completed: 'Completed', cancelled: 'Cancelled' };

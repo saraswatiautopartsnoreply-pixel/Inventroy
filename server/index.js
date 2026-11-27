@@ -20,6 +20,7 @@ import { PaymentLink } from './models/PaymentLink.js';
 import { Rack } from './models/Rack.js';
 import { SystemSetting } from './models/SystemSetting.js';
 import { PackingPhoto } from './models/PackingPhoto.js';
+import { backblazeConfigured, deleteBackblazeMedia, downloadBackblazeMedia, uploadBackblazeMedia } from './storage/backblaze.js';
 import { PushSubscription } from './models/PushSubscription.js';
 import { ActivityEvent } from './models/ActivityEvent.js';
 import { UserSession } from './models/UserSession.js';
@@ -51,6 +52,7 @@ let demoSystemSettings = { allowZeroStockSales: true };
 const cacheFlights = new Map();
 let productSequenceReady;
 const photoRetentionMs = 7 * 24 * 60 * 60 * 1000;
+const maximumVideoBytes = 30 * 1024 * 1024;
 const auditRetentionDays = 210;
 const auditRetentionMs = auditRetentionDays * 24 * 60 * 60 * 1000;
 const gstRate = 18;
@@ -332,7 +334,31 @@ async function invalidateSearchCache() {
 
 function photoMetadata(photo) {
   const id = String(photo._id || photo.id);
-  return { id, orderId: photo.orderId, productId: photo.productId, sku: photo.sku, productName: photo.productName, warehouse: photo.warehouse, packerId: photo.packerId, packerName: photo.packerName, keep: Boolean(photo.keep), expiresAt: photo.expiresAt ? new Date(photo.expiresAt).toISOString() : null, createdAt: photo.createdAt ? new Date(photo.createdAt).toISOString() : new Date().toISOString(), imageUrl: `/api/packing-photos/${encodeURIComponent(id)}/image` };
+  return { id, orderId: photo.orderId, productId: photo.productId, sku: photo.sku, productName: photo.productName, warehouse: photo.warehouse, packerId: photo.packerId, packerName: photo.packerName, mediaType: photo.mediaType || 'image', mimeType: photo.mimeType, keep: Boolean(photo.keep), expiresAt: photo.expiresAt ? new Date(photo.expiresAt).toISOString() : null, createdAt: photo.createdAt ? new Date(photo.createdAt).toISOString() : new Date().toISOString(), imageUrl: `/api/packing-photos/${encodeURIComponent(id)}/media` };
+}
+
+function validateMediaSignature(mediaType, mimeType, file) {
+  if (mediaType === 'image') {
+    if (mimeType === 'image/jpeg') return file[0] === 0xff && file[1] === 0xd8;
+    if (mimeType === 'image/png') return file.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    if (mimeType === 'image/webp') return file.subarray(0, 4).toString() === 'RIFF' && file.subarray(8, 12).toString() === 'WEBP';
+    return false;
+  }
+  if (mimeType === 'video/webm') return file.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+  if (mimeType === 'video/mp4' || mimeType === 'video/quicktime') return file.subarray(4, 8).toString() === 'ftyp';
+  return false;
+}
+
+async function sweepExpiredPackingMedia() {
+  if (dataSource !== 'mongodb') {
+    demoPackingPhotos = demoPackingPhotos.filter((photo) => photo.keep || !photo.expiresAt || new Date(photo.expiresAt) > new Date());
+    return;
+  }
+  const expired = await PackingPhoto.find({ keep: { $ne: true }, expiresAt: { $lte: new Date() } }).select('_id storageProvider storageFileId storageFileName').limit(100).lean();
+  for (const photo of expired) {
+    if (photo.storageProvider === 'backblaze') await deleteBackblazeMedia(photo.storageFileId, photo.storageFileName);
+    await PackingPhoto.deleteOne({ _id: photo._id, keep: { $ne: true }, expiresAt: { $lte: new Date() } });
+  }
 }
 
 function photoImageBuffer(image) {
@@ -721,7 +747,7 @@ async function wooYmmRequest(path) {
 
 app.get('/api/health', (_request, response) => {
   const ready = dataSource === 'mongodb' && mongoose.connection.readyState === 1 && (!production || redisClient?.isReady);
-  response.status(ready || !production ? 200 : 503).json({ ok: ready || !production, source: dataSource, cache: redisClient?.isReady ? 'ready' : 'disabled' });
+  response.status(ready || !production ? 200 : 503).json({ ok: ready || !production, source: dataSource, cache: redisClient?.isReady ? 'ready' : 'disabled', mediaStorage: backblazeConfigured() ? 'backblaze' : 'mongodb' });
 });
 
 app.get('/api/settings', requireAuth, requireManager, async (_request, response, next) => {
@@ -1800,23 +1826,27 @@ app.get('/api/orders/:id/photos', requireAuth, async (request, response, next) =
   } catch (error) { return next(error); }
 });
 
-app.post('/api/orders/:id/photos', requireAuth, async (request, response, next) => {
+app.post('/api/orders/:id/photos', requireAuth, express.raw({ type: ['image/*', 'video/*', 'application/octet-stream'], limit: '32mb' }), async (request, response, next) => {
   try {
     if (request.user.role !== 'Packer') return response.status(403).json({ error: 'Only the assigned packer can upload packing photos.' });
     const order = await findAccessibleOrder(request.params.id, request.user);
     if (!order) return response.status(404).json({ error: 'Order not found.' });
     if (!['accepted', 'packing'].includes(order.status)) return response.status(409).json({ error: 'Packing photos can only be added while this order is being packed.' });
-    const sku = String(request.body?.sku || '').trim().toUpperCase();
+    const binaryUpload = Buffer.isBuffer(request.body);
+    const sku = String(binaryUpload ? request.get('x-product-sku') || '' : request.body?.sku || '').trim().toUpperCase();
     const item = (order.items || []).find((line) => line.sku === sku);
     if (!item) return response.status(400).json({ error: 'Choose a product from this order.' });
-    const dataUrl = String(request.body?.imageData || '');
+    const dataUrl = String(binaryUpload ? '' : request.body?.imageData || '');
     const match = dataUrl.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/);
-    if (!match) return response.status(400).json({ error: 'Upload a JPEG, PNG, or WebP image.' });
-    const image = Buffer.from(match[2], 'base64');
-    if (!image.length || image.length > 1_500_000) return response.status(413).json({ error: 'Packing photos must be smaller than 1.5 MB after compression.' });
-    const mimeType = match[1];
-    const validSignature = mimeType === 'image/jpeg' ? image[0] === 0xff && image[1] === 0xd8 : mimeType === 'image/png' ? image.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) : image.subarray(0, 4).toString() === 'RIFF' && image.subarray(8, 12).toString() === 'WEBP';
-    if (!validSignature) return response.status(400).json({ error: 'The uploaded file does not match its image type.' });
+    const mimeType = binaryUpload ? String(request.get('content-type') || '').split(';')[0].toLowerCase() : match?.[1];
+    const mediaType = mimeType?.startsWith('video/') ? 'video' : 'image';
+    const supportedTypes = ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime'];
+    if (!binaryUpload && !match) return response.status(400).json({ error: 'Upload a JPEG, PNG, WebP, MP4, WebM, or QuickTime video.' });
+    if (!supportedTypes.includes(mimeType)) return response.status(400).json({ error: 'Upload a supported JPEG, PNG, WebP, MP4, WebM, or QuickTime media file.' });
+    const image = binaryUpload ? request.body : Buffer.from(match[2], 'base64');
+    const maximumBytes = mediaType === 'video' ? maximumVideoBytes : 1_500_000;
+    if (!image.length || image.length > maximumBytes) return response.status(413).json({ error: mediaType === 'video' ? 'Packing videos must be smaller than 30 MB.' : 'Packing photos must be smaller than 1.5 MB after compression.' });
+    if (!validateMediaSignature(mediaType, mimeType, image)) return response.status(400).json({ error: 'The uploaded file does not match its media type.' });
     const productId = String(item.productId || item.sku);
     const filter = { orderId: request.params.id, productId };
     const count = dataSource === 'mongodb'
@@ -1825,13 +1855,25 @@ app.post('/api/orders/:id/photos', requireAuth, async (request, response, next) 
     if (count >= 10) return response.status(409).json({ error: 'This product already has 10 packing photos for this order.' });
     const savedProduct = dataSource === 'mongodb' ? await Product.findById(productId).select('keepPackingPhotos').lean() : demoProductStore.find((product) => String(product.id) === productId);
     const keep = Boolean(savedProduct?.keepPackingPhotos);
-    const values = { ...filter, sku, productName: item.name, warehouse: order.warehouse, packerId: request.user.id, packerName: request.user.name, mimeType, image, keep, expiresAt: keep ? null : new Date(Date.now() + photoRetentionMs) };
-    const photo = dataSource === 'mongodb' ? await PackingPhoto.create(values) : (() => { const created = { ...values, id: `photo-${Date.now()}-${randomBytes(3).toString('hex')}`, imageData: `data:${mimeType};base64,${image.toString('base64')}`, createdAt: new Date() }; demoPackingPhotos.push(created); return created; })();
+    const values = { ...filter, sku, productName: item.name, warehouse: order.warehouse, packerId: request.user.id, packerName: request.user.name, mimeType, mediaType, image, keep, expiresAt: keep ? null : new Date(Date.now() + photoRetentionMs) };
+    let photo = dataSource === 'mongodb' ? await PackingPhoto.create(values) : (() => { const created = { ...values, id: `photo-${Date.now()}-${randomBytes(3).toString('hex')}`, imageData: `data:${mimeType};base64,${image.toString('base64')}`, createdAt: new Date() }; demoPackingPhotos.push(created); return created; })();
+    if (dataSource === 'mongodb' && backblazeConfigured()) {
+      const extension = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' }[mimeType];
+      const storageFileName = `packing-media/${String(photo._id)}.${extension}`;
+      try {
+        const uploaded = await uploadBackblazeMedia({ body: image, contentType: mimeType, fileName: storageFileName });
+        await PackingPhoto.updateOne({ _id: photo._id }, { $set: { storageProvider: 'backblaze', storageFileId: uploaded.fileId, storageFileName }, $unset: { image: 1 } });
+        photo = await PackingPhoto.findById(photo._id).lean();
+      } catch (error) {
+        await PackingPhoto.deleteOne({ _id: photo._id }).catch(() => {});
+        throw Object.assign(new Error('Upload to Backblaze failed. The media was not saved; check the server B2 settings and retry.'), { status: 502, cause: error });
+      }
+    }
     return response.status(201).json({ photo: photoMetadata(photo) });
   } catch (error) { return next(error); }
 });
 
-app.get('/api/packing-photos/:id/image', requireAuth, async (request, response, next) => {
+const getPackingMedia = async (request, response, next) => {
   try {
     const photo = dataSource === 'mongodb' && mongoose.isValidObjectId(request.params.id)
       ? await PackingPhoto.findOne({ _id: request.params.id, $or: [{ keep: true }, { expiresAt: { $gt: new Date() } }] }).lean()
@@ -1840,11 +1882,23 @@ app.get('/api/packing-photos/:id/image', requireAuth, async (request, response, 
     const order = await findAccessibleOrder(photo.orderId, request.user);
     if (!order) return response.status(404).json({ error: 'Packing photo not found.' });
     response.setHeader('Content-Type', photo.mimeType); response.setHeader('Cache-Control', 'private, no-store'); response.setHeader('X-Content-Type-Options', 'nosniff');
-    const image = dataSource === 'mongodb' ? photoImageBuffer(photo.image) : Buffer.from(photo.imageData.split(',')[1], 'base64');
+    response.setHeader('Content-Disposition', 'inline');
+    let image;
+    if (dataSource === 'mongodb' && photo.storageProvider === 'backblaze' && photo.storageFileId) {
+      const mediaResponse = await downloadBackblazeMedia(photo.storageFileId, request.get('range') || '');
+      if (mediaResponse.status === 206) {
+        response.status(206);
+        for (const header of ['content-range', 'accept-ranges']) { const value = mediaResponse.headers.get(header); if (value) response.setHeader(header, value); }
+      }
+      const length = mediaResponse.headers.get('content-length'); if (length) response.setHeader('Content-Length', length);
+      image = Buffer.from(await mediaResponse.arrayBuffer());
+    } else image = dataSource === 'mongodb' ? photoImageBuffer(photo.image) : Buffer.from(photo.imageData.split(',')[1], 'base64');
     if (!image.length) return response.status(500).json({ error: 'Packing photo data is empty or unreadable.' });
     return response.send(image);
   } catch (error) { return next(error); }
-});
+};
+app.get('/api/packing-photos/:id/media', requireAuth, getPackingMedia);
+app.get('/api/packing-photos/:id/image', requireAuth, getPackingMedia);
 
 app.patch('/api/products/:productId/packing-photos/keep', requireAuth, requireManager, async (request, response, next) => {
   try {
@@ -1864,6 +1918,9 @@ app.delete('/api/packing-photos/:id', requireAuth, requireManager, async (reques
     let deleted;
     if (dataSource === 'mongodb') {
       if (!mongoose.isValidObjectId(request.params.id)) return response.status(404).json({ error: 'Packing photo not found.' });
+      const photo = await PackingPhoto.findById(request.params.id).select('storageProvider storageFileId storageFileName').lean();
+      if (!photo) return response.status(404).json({ error: 'Packing photo not found.' });
+      if (photo.storageProvider === 'backblaze') await deleteBackblazeMedia(photo.storageFileId, photo.storageFileName);
       deleted = (await PackingPhoto.deleteOne({ _id: request.params.id })).deletedCount;
     } else { const previousLength = demoPackingPhotos.length; demoPackingPhotos = demoPackingPhotos.filter((photo) => photo.id !== request.params.id); deleted = previousLength - demoPackingPhotos.length; }
     if (!deleted) return response.status(404).json({ error: 'Packing photo not found.' });
@@ -2046,9 +2103,14 @@ app.use((error, _request, response, _next) => {
 
 let server;
 let sessionSweepTimer;
+let mediaSweepTimer;
 async function start() {
   if (process.env.MONGODB_URI) {
     await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 8000, autoIndex: !production }); dataSource = 'mongodb';
+    const mediaCollection = mongoose.connection.collection(PackingPhoto.collection.collectionName);
+    const mediaIndexes = await mediaCollection.indexes().catch((error) => error.codeName === 'NamespaceNotFound' ? [] : Promise.reject(error));
+    const oldTtlIndex = mediaIndexes.find((index) => index.key?.expiresAt === 1 && index.expireAfterSeconds !== undefined);
+    if (oldTtlIndex) await mediaCollection.dropIndex(oldTtlIndex.name);
     await Promise.all([Product.createIndexes(), ProductCounter.createIndexes(), User.createIndexes(), Order.createIndexes(), PaymentLink.createIndexes(), Rack.createIndexes(), SystemSetting.createIndexes(), PackingPhoto.createIndexes(), PushSubscription.createIndexes(), ActivityEvent.createIndexes(), UserSession.createIndexes()]);
     await User.updateMany({ role: 'Sales Person' }, { $set: { role: 'Packer', approved: true, active: true } });
     if (process.env.BOOTSTRAP_ADMIN_EMAIL && process.env.BOOTSTRAP_ADMIN_PASSWORD) {
@@ -2057,6 +2119,9 @@ async function start() {
     }
     console.info('Connected to MongoDB.');
   }
+  await sweepExpiredPackingMedia().catch((error) => console.warn('Packing media cleanup deferred:', error.message));
+  mediaSweepTimer = setInterval(() => sweepExpiredPackingMedia().catch((error) => console.warn('Packing media cleanup failed; will retry:', error.message)), 60_000);
+  mediaSweepTimer.unref();
   await sweepLostSessions();
   sessionSweepTimer = setInterval(() => sweepLostSessions().catch((error) => console.warn('Session cleanup failed:', error.message)), 60_000);
   sessionSweepTimer.unref();
@@ -2070,6 +2135,7 @@ async function start() {
 async function shutdown(signal) {
   console.info(`Received ${signal}; shutting down.`);
   if (sessionSweepTimer) clearInterval(sessionSweepTimer);
+  if (mediaSweepTimer) clearInterval(mediaSweepTimer);
   if (server) await new Promise((resolve) => server.close(resolve));
   if (redisClient?.isOpen) await redisClient.quit(); if (mongoose.connection.readyState) await mongoose.disconnect(); process.exit(0);
 }

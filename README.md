@@ -45,6 +45,12 @@ Set `WOOCOMMERCE_URL`, `WOOCOMMERCE_CONSUMER_KEY`, and `WOOCOMMERCE_CONSUMER_SEC
 
 set "Razorpay_SECRET_key" and "razorpay_consumer_key" in the API server environment. and a refresh button to check payment status In Razorpay, set the webhook URL to https://your-domain/api/webhooks/razorpay, use the same secret as RAZORPAY_WEBHOOK_SECRET in the server .env, and subscribe to payment_link.paid, payment_link.partially_paid, payment_link.cancelled, payment_link.expired, and payment.failed.
 
+## Backblaze B2 packing media
+
+Packing photos and videos use Backblaze B2 when the following server environment variables are configured: `BACKBLAZE_KEY_ID`, `BACKBLAZE_APPLICATION_KEY`, and `BACKBLAZE_BUCKET_ID`. Keep the bucket private. Create a bucket-restricted application key with `readFiles`, `writeFiles`, and `deleteFiles` capabilities, and restrict it to the `packing-media/` file-name prefix if available. Keep all B2 credentials on the API server; never send them to the browser, commit them, or paste them in chat. The API health response reports `mediaStorage: "backblaze"` once configured.
+
+Packer uploads compress images to WebP before sending them to the API. The app also accepts MP4, WebM, and QuickTime videos up to 30 MB. Managers view media through an authenticated app endpoint, so bucket credentials and direct public URLs are not exposed. Unkept media expires after seven days; kept media remains until manually deleted. Existing MongoDB media can be previewed and then moved with `npm run migrate:packing-media` and `npm run migrate:packing-media -- --apply`. The migration uploads each file before removing its MongoDB binary, and failed records remain in MongoDB for a retry. Back up MongoDB before migration.
+
 ## Production deployment and safe updates
 
 The included `render.yaml` deploys the React app and API as one HTTPS web service in Singapore, with a private Redis-compatible cache and a `/api/health` readiness check. It expects a MongoDB Atlas replica-set URI from the Render secret prompt; it does not create a MongoDB cluster or change an existing Atlas database. Choose the Atlas cluster in the same region as the app where possible. Render Key Value and web compute are billable services; review current prices before creating the Blueprint.

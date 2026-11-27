@@ -12,6 +12,7 @@
     "migrate:categories": "node server/migrations/backfill-product-categories.js",
     "migrate:product-ids": "node server/migrations/migrate-product-numbers.js",
     "migrate:clear-product-names": "node server/migrations/clear-product-names.js",
+    "migrate:packing-media": "node server/migrations/migrate-packing-media-to-backblaze.js",
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview"
